@@ -430,6 +430,8 @@ pub struct CacheMeter {
     /// 计量模拟总开关（运行时可由 Admin API 切换，无需重启）。
     /// 关闭时 `compute_cache_usage` 直接返回全量 input、零缓存，且不读写任何缓存态。
     enabled: std::sync::atomic::AtomicBool,
+    /// 生效条目上限，构造后不变（改容量 = 改 config.json + 重启）
+    capacity: usize,
 }
 
 #[derive(Default)]
@@ -474,6 +476,7 @@ impl CacheMeter {
             persist_path,
             remote,
             enabled: std::sync::atomic::AtomicBool::new(true),
+            capacity: DEFAULT_CAPACITY,
         }
     }
 
@@ -493,6 +496,17 @@ impl CacheMeter {
     pub fn with_enabled(self, enabled: bool) -> Self {
         self.set_enabled(enabled);
         self
+    }
+
+    /// builder 风格设置生效容量。调用方应先用 `resolve_capacity` 算出钳制后的值。
+    pub fn with_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = capacity.clamp(MIN_CAPACITY, MAX_CAPACITY);
+        self
+    }
+
+    /// 当前生效容量。
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// 读取 `KIRO_RS_CACHE_METERING` 环境变量表达的开关意图。
@@ -635,21 +649,44 @@ impl CacheMeter {
             },
         );
         inner.dirty = true;
-        self.enforce_capacity(&mut inner);
+        if inner.entries.len() > hard_limit(self.capacity) {
+            self.shrink_to_watermark(&mut inner);
+        }
     }
 
-    fn enforce_capacity(&self, inner: &mut Inner) {
-        if inner.entries.len() > DEFAULT_CAPACITY {
-            let drop_n = inner.entries.len() - DEFAULT_CAPACITY;
-            let mut victims: Vec<(u64, i64)> = inner
-                .entries
-                .iter()
-                .map(|(k, v)| (*k, v.last_hit_at))
-                .collect();
-            victims.sort_by_key(|x| x.1);
-            for (k, _) in victims.into_iter().take(drop_n) {
-                inner.entries.remove(&k);
-            }
+    /// 把表清到 `0.9 * capacity` 水位。单次 `O(n)`：用
+    /// `select_nth_unstable_by_key` 把 `last_hit_at` 最小的 drop_n 条划到前半段
+    /// （顺序不定、不需要有序），取代原来的 `O(n log n)` 全表排序。
+    ///
+    /// `last_hit_at` 相等时谁被淘汰不确定 —— LRU 本就是近似，接受。
+    fn shrink_to_watermark(&self, inner: &mut Inner) {
+        let target = watermark(self.capacity);
+        let len = inner.entries.len();
+        if len <= target {
+            return;
+        }
+        let drop_n = len - target;
+        let mut victims: Vec<(u64, i64)> = inner
+            .entries
+            .iter()
+            .map(|(k, v)| (*k, v.last_hit_at))
+            .collect();
+        // drop_n >= 1 由上面的早退保证，drop_n - 1 不会下溢
+        victims.select_nth_unstable_by_key(drop_n - 1, |x| x.1);
+        victims.truncate(drop_n);
+        for (k, _) in victims {
+            inner.entries.remove(&k);
+        }
+        inner.dirty = true;
+    }
+
+    /// 后台巡检一轮：先清过期，再在超过 `capacity` 时清到水位。
+    /// `record_entry` 的 `1.2C` 兜底只在突发写入快过本回收时才会触发。
+    pub fn sweep(&self) {
+        self.evict_expired();
+        let mut inner = self.inner.lock();
+        if inner.entries.len() > self.capacity {
+            self.shrink_to_watermark(&mut inner);
         }
     }
 
@@ -690,7 +727,7 @@ impl CacheMeter {
             loop {
                 tokio::time::sleep(interval).await;
                 let Some(cache) = weak.upgrade() else { return };
-                cache.evict_expired();
+                cache.sweep();
                 cache.flush_to_disk();
             }
         });
@@ -708,10 +745,25 @@ impl CacheMeter {
         }
     }
 
-    #[cfg(test)]
-    fn len(&self) -> usize {
+    /// 当前表内条目数（含已过期但尚未被清理的）。
+    pub fn len(&self) -> usize {
         self.inner.lock().entries.len()
     }
+
+    /// 表是否为空（clippy 要求与 `len` 成对）。
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// `record_entry` 的强制淘汰触发线：`capacity * 1.2`。
+fn hard_limit(capacity: usize) -> usize {
+    capacity.saturating_mul(6) / 5
+}
+
+/// 一次淘汰清到的目标水位：`capacity * 0.9`。
+fn watermark(capacity: usize) -> usize {
+    capacity / 10 * 9
 }
 
 /// 解析布尔型环境变量：`0/off/false/no/disabled` 为假，其余非空为真，空串/未设置返回 None。
@@ -3446,5 +3498,107 @@ mod tests {
         }
         assert_eq!(CacheMeter::persist_enabled_from_env(), None);
         assert_eq!(CacheMeter::miss_diagnostics_from_env(), None);
+    }
+
+    /// 构造一个容量确定、last_hit_at 可控的 meter。
+    ///
+    /// 注意：`with_capacity` 自己会把入参钳到 `[MIN_CAPACITY, MAX_CAPACITY]`，
+    /// 所以这里只能传 **≥ 1024** 的合法容量。
+    fn meter_with_capacity(capacity: usize) -> CacheMeter {
+        let cache = CacheMeter::new(None).with_capacity(capacity);
+        assert_eq!(cache.capacity(), capacity, "测试容量必须落在合法区间内");
+        cache
+    }
+
+    #[test]
+    fn record_entry_does_not_evict_below_hard_ratio() {
+        let cache = meter_with_capacity(2_000);
+        for i in 0..2_300u64 {
+            cache.record_entry(i, 1, 300);
+        }
+        assert_eq!(cache.len(), 2_300, "未越过 1.2C(=2400) 硬顶，不应强制淘汰");
+    }
+
+    #[test]
+    fn record_entry_shrinks_to_watermark_above_hard_ratio() {
+        let cache = meter_with_capacity(2_000);
+        for i in 0..2_401u64 {
+            cache.record_entry(i, 1, 300);
+        }
+        assert_eq!(
+            cache.len(),
+            1_800,
+            "越过 1.2C(=2400) 应一次清到 0.9C(=1800)"
+        );
+    }
+
+    #[test]
+    fn shrink_evicts_least_recently_hit_first() {
+        let cache = meter_with_capacity(2_000);
+        for i in 0..2_400u64 {
+            cache.record_entry(i, 1, 300);
+        }
+        // 下面再插一条就是 2401 条，淘汰量正好 601（2401 - 0.9*2000），
+        // 所以「很久以前」那组也要正好 601 条，否则 last_hit_at 相同的条目之间
+        // 会出现不确定的 tie-break，断言不稳。
+        // 0..1799 标成最近命中（1799 条），1799..2400 标成很久以前（601 条）。
+        {
+            let mut inner = cache.inner.lock();
+            let now = now_secs();
+            for (k, v) in inner.entries.iter_mut() {
+                v.last_hit_at = if *k < 1_799 { now } else { now - 10_000 };
+            }
+        }
+        // 再插一条（last_hit_at = now，属于最近组）越过 1.2C 硬顶：2401 > 2400
+        cache.record_entry(9_999, 1, 300);
+        assert_eq!(cache.len(), 1_800);
+        let inner = cache.inner.lock();
+        for k in 0..1_799u64 {
+            assert!(inner.entries.contains_key(&k), "最近命中的 {k} 不该被淘汰");
+        }
+        assert!(inner.entries.contains_key(&9_999), "刚写入的条目不该被淘汰");
+        for k in 1_799..2_400u64 {
+            assert!(!inner.entries.contains_key(&k), "最久未命中的 {k} 应被淘汰");
+        }
+    }
+
+    #[test]
+    fn background_sweep_shrinks_above_capacity() {
+        let cache = meter_with_capacity(2_000);
+        for i in 0..2_100u64 {
+            cache.record_entry(i, 1, 300);
+        }
+        assert_eq!(cache.len(), 2_100, "1.0C~1.2C 之间 record_entry 不动手");
+        cache.sweep();
+        assert_eq!(cache.len(), 1_800, "后台巡检应把超过 1.0C 的表清到 0.9C");
+    }
+
+    /// Review Focus 2：capacity 取下限时 drop_n-1 == 0 与 saturating_mul 的边界。
+    #[test]
+    fn shrink_handles_minimum_capacity_without_panic() {
+        let cache = meter_with_capacity(MIN_CAPACITY);
+        // 刚好越过硬顶一条：len = 1024*6/5 + 1 = 1229
+        for i in 0..1_229u64 {
+            cache.record_entry(i, 1, 300);
+        }
+        assert_eq!(cache.len(), MIN_CAPACITY / 10 * 9);
+        // 上限不溢出
+        assert_eq!(hard_limit(MAX_CAPACITY), MAX_CAPACITY * 6 / 5);
+        assert_eq!(hard_limit(usize::MAX), usize::MAX / 5);
+        // 单条越过水位时 drop_n == 1，select_nth_unstable_by_key(0, ..) 必须合法。
+        // 注意不能用 sweep()：len = watermark + 1 = 922 还没超过 capacity(1024)，
+        // sweep 会直接早退、根本不触发淘汰，覆盖不到这个边界。必须直接调
+        // shrink_to_watermark（同模块子 mod，可访问私有方法）。
+        let tiny = meter_with_capacity(MIN_CAPACITY);
+        let target = watermark(MIN_CAPACITY);
+        for i in 0..(target + 1) as u64 {
+            tiny.record_entry(i, 1, 300);
+        }
+        assert_eq!(tiny.len(), target + 1, "此时还没到 capacity，不该自发淘汰");
+        {
+            let mut inner = tiny.inner.lock();
+            tiny.shrink_to_watermark(&mut inner);
+        }
+        assert_eq!(tiny.len(), target, "drop_n == 1 的边界必须正好清掉一条");
     }
 }
