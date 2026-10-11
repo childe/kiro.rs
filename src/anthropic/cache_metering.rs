@@ -785,6 +785,26 @@ impl CacheMeter {
         self.inner.lock().stats.take_delta()
     }
 
+    /// 请求没有任何可用断点（无 cache_control / 超 MAX_BREAKPOINTS / 混合 TTL 顺序非法）。
+    pub fn note_miss_no_breakpoint(&self) {
+        {
+            let mut inner = self.inner.lock();
+            inner.stats.add(|s| &mut s.misses, 1);
+            inner.stats.add(|s| &mut s.miss_no_breakpoint, 1);
+        }
+        tracing::debug!("cache_meter miss reason=no_breakpoint");
+    }
+
+    /// 请求拿不到会话隔离种子（无 metadata.user_id 且 key_id == 0）。
+    pub fn note_miss_no_seed(&self) {
+        {
+            let mut inner = self.inner.lock();
+            inner.stats.add(|s| &mut s.misses, 1);
+            inner.stats.add(|s| &mut s.miss_no_seed, 1);
+        }
+        tracing::debug!("cache_meter miss reason=no_seed");
+    }
+
     /// 写入单个断点条目，按指定的 ttl_secs 设置过期时间
     pub fn record_entry(&self, hash: u64, tokens: u32, ttl_secs: i64) {
         let ttl = ttl_secs.clamp(60, MAX_TTL_SECS);
@@ -1235,6 +1255,7 @@ pub async fn compute_cache_usage(
     let breakpoints = resolve_breakpoints(&blocks, req.cache_control.as_ref());
     if breakpoints.is_empty() {
         // 无断点：官方不会缓存，全部计入 input
+        cache.note_miss_no_breakpoint();
         return CacheUsage {
             prompt_total_est: prompt_total_est as i32,
             ..Default::default()
@@ -1243,6 +1264,7 @@ pub async fn compute_cache_usage(
 
     // 会话隔离种子
     let Some(seed) = isolation_seed(req, key_id) else {
+        cache.note_miss_no_seed();
         return CacheUsage {
             prompt_total_est: prompt_total_est as i32,
             ..Default::default()
@@ -1275,6 +1297,12 @@ pub async fn compute_cache_usage(
 
     for bp in &breakpoints {
         let start_idx = lookback_start_index(&blocks, bp.block_idx);
+        // 归因取最深那个 hash（第一次探测）的判定结果 —— 它才是本可命中的那一条
+        let mut deepest_reason = LookupOutcome::Absent;
+        // 一个断点只记一次账：探测期间一律用不计数的 probe_outcome，
+        // 循环结束后按最终结果调一次 note_lookup。
+        let mut hit_tokens_final: Option<u32> = None;
+
         for check_idx in (start_idx..=bp.block_idx).rev() {
             let hash = cum_hashes[check_idx];
             let mut hit_tokens = None;
@@ -1290,7 +1318,13 @@ pub async fn compute_cache_usage(
 
             // 若远端未配置或 miss / 出错降级，查本地
             if hit_tokens.is_none() {
-                hit_tokens = cache.lookup_and_renew(hash);
+                let outcome = cache.probe_outcome(hash);
+                if check_idx == bp.block_idx {
+                    deepest_reason = outcome;
+                }
+                if let LookupOutcome::Hit(tokens) = outcome {
+                    hit_tokens = Some(tokens);
+                }
             }
 
             if let Some(tokens) = hit_tokens {
@@ -1298,7 +1332,23 @@ pub async fn compute_cache_usage(
                     max_read_tokens = tokens;
                 }
                 // 当前断点已找到最深命中，不必继续向更浅的 block 回溯
+                hit_tokens_final = Some(tokens);
                 break;
+            }
+        }
+
+        match hit_tokens_final {
+            // 本地或远端命中都走这里：一个断点记 1 次 hit
+            Some(tokens) => cache.note_lookup(LookupOutcome::Hit(tokens)),
+            None => {
+                // 全部落空：记 1 次 miss，原因取最深那次探测的判定
+                cache.note_lookup(deepest_reason);
+                tracing::debug!(
+                    "cache_meter miss block_idx={} reason={:?} ttl={}",
+                    bp.block_idx,
+                    deepest_reason,
+                    bp.ttl_secs
+                );
             }
         }
     }
@@ -1351,6 +1401,7 @@ pub fn compute_cache_usage_sync(
     // 解析断点（显式 + 顶层自动）
     let breakpoints = resolve_breakpoints(&blocks, req.cache_control.as_ref());
     if breakpoints.is_empty() {
+        cache.note_miss_no_breakpoint();
         return CacheUsage {
             prompt_total_est: prompt_total_est as i32,
             ..Default::default()
@@ -1358,6 +1409,7 @@ pub fn compute_cache_usage_sync(
     }
 
     let Some(seed) = isolation_seed(req, key_id) else {
+        cache.note_miss_no_seed();
         return CacheUsage {
             prompt_total_est: prompt_total_est as i32,
             ..Default::default()
@@ -1388,13 +1440,35 @@ pub fn compute_cache_usage_sync(
 
     for bp in &breakpoints {
         let start_idx = lookback_start_index(&blocks, bp.block_idx);
+        // 归因取最深那个 hash（第一次探测）的判定结果
+        let mut deepest_reason = LookupOutcome::Absent;
+        let mut hit_tokens_final: Option<u32> = None;
+
         for check_idx in (start_idx..=bp.block_idx).rev() {
             let hash = cum_hashes[check_idx];
-            if let Some(tokens) = cache.lookup_and_renew(hash) {
+            let outcome = cache.probe_outcome(hash);
+            if check_idx == bp.block_idx {
+                deepest_reason = outcome;
+            }
+            if let LookupOutcome::Hit(tokens) = outcome {
                 if tokens > max_read_tokens {
                     max_read_tokens = tokens;
                 }
+                hit_tokens_final = Some(tokens);
                 break;
+            }
+        }
+
+        match hit_tokens_final {
+            Some(tokens) => cache.note_lookup(LookupOutcome::Hit(tokens)),
+            None => {
+                cache.note_lookup(deepest_reason);
+                tracing::debug!(
+                    "cache_meter miss block_idx={} reason={:?} ttl={}",
+                    bp.block_idx,
+                    deepest_reason,
+                    bp.ttl_secs
+                );
             }
         }
     }
@@ -3925,5 +3999,177 @@ mod tests {
             !cache.inner.lock().tombstones.contains_key(&42),
             "重新写入后旧墓碑必须被删除，否则下次淘汰归因会串"
         );
+    }
+
+    /// 构造一个完全没有 cache_control 的请求（无断点）。
+    fn build_request_without_breakpoint() -> MessagesRequest {
+        use super::super::types::Message;
+        MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 32,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("Hello".to_string()),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn compute_cache_usage_counts_miss_no_breakpoint() {
+        let cache = CacheMeter::new(None);
+        let req = build_request_without_breakpoint();
+        let usage = compute_cache_usage(&cache, &req, 1).await;
+        assert_eq!(usage.cache_read, 0);
+        assert!(usage.prompt_total_est > 0);
+        let stats = cache.stats_total();
+        assert_eq!(stats.miss_no_breakpoint, 1);
+        assert_eq!(stats.miss_no_seed, 0);
+        assert_eq!(stats.misses, 1);
+    }
+
+    #[tokio::test]
+    async fn compute_cache_usage_counts_miss_no_seed() {
+        // 有断点但 key_id == 0 且没有 metadata.user_id → isolation_seed 返回 None
+        let cache = CacheMeter::new(None);
+        let req = build_request_with_system_breakpoint();
+        let usage = compute_cache_usage(&cache, &req, 0).await;
+        assert_eq!(usage.cache_read, 0);
+        let stats = cache.stats_total();
+        assert_eq!(stats.miss_no_seed, 1);
+        assert_eq!(stats.miss_no_breakpoint, 0);
+        assert_eq!(stats.misses, 1);
+    }
+
+    /// Review Focus 3：远端命中走 remote 路径，必须记成 hit，不能记成 miss。
+    #[tokio::test]
+    async fn remote_hit_counts_as_hit_not_miss() {
+        let remote = Arc::new(FakeRemoteStore::default());
+        let cache = CacheMeter::with_remote(None, Some(remote.clone()));
+        let req = build_request_with_system_breakpoint();
+
+        // 第一次：本地远端都 miss，写入两边
+        let _ = compute_cache_usage(&cache, &req, 1).await;
+        let after_cold = cache.stats_total();
+        assert!(after_cold.misses > 0);
+
+        // 清掉本地表（墓碑一并清），只留远端 → 下一次必须走远端命中
+        {
+            let mut inner = cache.inner.lock();
+            inner.entries.clear();
+            inner.tombstones.clear();
+        }
+        let before = cache.stats_total();
+        let warm = compute_cache_usage(&cache, &req, 1).await;
+        let after = cache.stats_total();
+
+        assert!(warm.cache_read > 0, "应从远端命中");
+        assert_eq!(after.hits, before.hits + 1, "远端命中必须计 1 次 hit");
+        assert_eq!(after.misses, before.misses, "远端命中不得计入 misses");
+    }
+
+    /// 构造 user 消息为 text block 数组的请求。
+    /// `bp_on_first = true`：只有第 0 块、断点在第 0 块（用来预热浅层前缀）。
+    /// `bp_on_first = false`：第 0、1 两块、断点在第 1 块 —— 它的 lookback 能回溯到
+    /// 第 0 块，正是「深层不存在、浅层命中」要用的形状。两者第 0 块内容完全一致，
+    /// 所以 cum_hash[0] 相同。
+    fn build_request_with_two_blocks(bp_on_first: bool) -> MessagesRequest {
+        use super::super::types::Message;
+        let cc = serde_json::json!({"type": "ephemeral"});
+        let mut first = serde_json::json!({"type": "text", "text": "A".repeat(400)});
+        let mut second = serde_json::json!({"type": "text", "text": "B".repeat(400)});
+        if bp_on_first {
+            first["cache_control"] = cc;
+        } else {
+            second["cache_control"] = cc;
+        }
+        let content = if bp_on_first {
+            serde_json::Value::Array(vec![first])
+        } else {
+            serde_json::Value::Array(vec![first, second])
+        };
+        MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 32,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content,
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        }
+    }
+
+    /// 全部落空：一个断点探测多个 hash 也只记 **1 次** miss。
+    #[test]
+    fn lookback_all_miss_counts_one_miss_per_breakpoint() {
+        let cache = CacheMeter::new(None);
+        let req = build_request_with_two_blocks(false);
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
+        assert_eq!(usage.cache_read, 0, "冷启动不该有 read");
+
+        let stats = cache.stats_total();
+        assert_eq!(stats.misses, 1, "一个断点只记一次 miss，不是每次探测一条");
+        assert_eq!(stats.miss_no_entry, 1);
+        assert_eq!(stats.hits, 0);
+    }
+
+    /// 深层不存在、浅层命中：记 1 次 hit、0 次 miss。
+    #[test]
+    fn lookback_deep_miss_shallow_hit_counts_one_hit_only() {
+        let cache = CacheMeter::new(None);
+        // 先用「断点在第 0 块」的请求写入浅层前缀
+        let seed_req = build_request_with_two_blocks(true);
+        let _ = compute_cache_usage_sync(&cache, &seed_req, 1);
+        let before = cache.stats_total();
+
+        // 再用「断点在第 1 块」的请求：最深 hash 没写过，回溯到第 0 块命中
+        let req = build_request_with_two_blocks(false);
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
+        assert!(usage.cache_read > 0, "应回溯命中浅层前缀");
+
+        let after = cache.stats_total();
+        assert_eq!(after.hits, before.hits + 1, "一次成功命中只记 1 次 hit");
+        assert_eq!(
+            after.misses, before.misses,
+            "命中的断点不得同时记 miss —— 深层探测落空不是业务 miss"
+        );
+    }
+
+    /// 远端路径下同样成立：深层落空、浅层命中只记 1 次 hit。
+    #[tokio::test]
+    async fn lookback_deep_miss_shallow_hit_counts_one_hit_remote() {
+        let remote = Arc::new(FakeRemoteStore::default());
+        let cache = CacheMeter::with_remote(None, Some(remote.clone()));
+        let seed_req = build_request_with_two_blocks(true);
+        let _ = compute_cache_usage(&cache, &seed_req, 1).await;
+
+        // 清掉本地表，强制走远端
+        {
+            let mut inner = cache.inner.lock();
+            inner.entries.clear();
+            inner.tombstones.clear();
+        }
+        let before = cache.stats_total();
+        let req = build_request_with_two_blocks(false);
+        let usage = compute_cache_usage(&cache, &req, 1).await;
+
+        assert!(usage.cache_read > 0, "应从远端回溯命中");
+        let after = cache.stats_total();
+        assert_eq!(after.hits, before.hits + 1);
+        assert_eq!(after.misses, before.misses);
     }
 }
