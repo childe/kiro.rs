@@ -33,8 +33,22 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// 默认条目上限（防止内存无限增长）
-const DEFAULT_CAPACITY: usize = 4096;
+/// 未配置时的默认条目上限。
+///
+/// 选型公式：`C >= peak_req_per_sec * entries_per_req * TTL_secs`。
+/// 上游 `entries_per_req <= MAX_BREAKPOINTS = 4`、默认 `TTL = 300s`，
+/// 262144 支撑约 `262144 / (4 * 300) ≈ 218 req/s`，内存约 16–24MB。
+const DEFAULT_CAPACITY: usize = 262_144;
+/// 容量下限（再小就不如直接关掉计量）
+const MIN_CAPACITY: usize = 1_024;
+/// 容量上限：按 64 字节/条估算约 512MB，是「再大就该上 Redis」的界线，不是推荐值
+const MAX_CAPACITY: usize = 8_388_608;
+/// 默认落盘间隔（秒）
+const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 300;
+/// 落盘间隔下限（秒）
+const MIN_FLUSH_INTERVAL_SECS: u64 = 10;
+/// 落盘间隔上限（秒）
+const MAX_FLUSH_INTERVAL_SECS: u64 = 3_600;
 /// 最长 TTL（1h，与 Anthropic ttl=\"1h\" 对齐）
 const MAX_TTL_SECS: i64 = 3600;
 /// 默认 TTL（5min，ephemeral 默认值）
@@ -489,15 +503,67 @@ impl CacheMeter {
     /// 生效优先级：config.json 显式值 > 本环境变量 > 默认开启。环境变量只作为
     /// 未落配置时的初值（适合全新 docker 部署），一旦从 UI 改过就以 config.json 为准。
     pub fn metering_enabled_from_env() -> Option<bool> {
-        let raw = std::env::var("KIRO_RS_CACHE_METERING").ok()?;
-        let raw = raw.trim().to_ascii_lowercase();
-        if raw.is_empty() {
-            return None;
+        bool_from_env("KIRO_RS_CACHE_METERING")
+    }
+
+    /// 读取 `KIRO_RS_CACHE_CAPACITY` 表达的容量意图。
+    pub fn capacity_from_env() -> Option<usize> {
+        usize_from_env("KIRO_RS_CACHE_CAPACITY")
+    }
+
+    /// 读取 `KIRO_RS_CACHE_FLUSH_INTERVAL_SECS` 表达的落盘间隔意图。
+    pub fn flush_interval_from_env() -> Option<u64> {
+        u64_from_env("KIRO_RS_CACHE_FLUSH_INTERVAL_SECS")
+    }
+
+    /// 读取 `KIRO_RS_CACHE_PERSIST` 表达的落盘开关意图。
+    pub fn persist_enabled_from_env() -> Option<bool> {
+        bool_from_env("KIRO_RS_CACHE_PERSIST")
+    }
+
+    /// 读取 `KIRO_RS_CACHE_MISS_DIAGNOSTICS` 表达的 miss 归因开关意图。
+    pub fn miss_diagnostics_from_env() -> Option<bool> {
+        bool_from_env("KIRO_RS_CACHE_MISS_DIAGNOSTICS")
+    }
+
+    /// 按 `config.json > 环境变量 > 内置默认` 定出生效容量，并钳到
+    /// `[MIN_CAPACITY, MAX_CAPACITY]`。越界时 warn 出原值与生效值。
+    pub fn resolve_capacity(from_config: Option<usize>, from_env: Option<usize>) -> usize {
+        let raw = from_config
+            .filter(|v| *v > 0)
+            .or_else(|| from_env.filter(|v| *v > 0))
+            .unwrap_or(DEFAULT_CAPACITY);
+        let clamped = raw.clamp(MIN_CAPACITY, MAX_CAPACITY);
+        if clamped != raw {
+            tracing::warn!(
+                "cacheMeteringCapacity={} 越界 [{}, {}]，已钳制为 {}",
+                raw,
+                MIN_CAPACITY,
+                MAX_CAPACITY,
+                clamped
+            );
         }
-        Some(!matches!(
-            raw.as_str(),
-            "0" | "off" | "false" | "no" | "disabled"
-        ))
+        clamped
+    }
+
+    /// 按 `config.json > 环境变量 > 内置默认` 定出生效落盘间隔，并钳到
+    /// `[MIN_FLUSH_INTERVAL_SECS, MAX_FLUSH_INTERVAL_SECS]`。
+    pub fn resolve_flush_interval_secs(from_config: Option<u64>, from_env: Option<u64>) -> u64 {
+        let raw = from_config
+            .filter(|v| *v > 0)
+            .or_else(|| from_env.filter(|v| *v > 0))
+            .unwrap_or(DEFAULT_FLUSH_INTERVAL_SECS);
+        let clamped = raw.clamp(MIN_FLUSH_INTERVAL_SECS, MAX_FLUSH_INTERVAL_SECS);
+        if clamped != raw {
+            tracing::warn!(
+                "cacheMeteringFlushIntervalSecs={} 越界 [{}, {}]，已钳制为 {}",
+                raw,
+                MIN_FLUSH_INTERVAL_SECS,
+                MAX_FLUSH_INTERVAL_SECS,
+                clamped
+            );
+        }
+        clamped
     }
 
     /// 从环境变量 `KIRO_RS_CACHE_REDIS_URL` 初始化 CacheMeter。
@@ -646,6 +712,44 @@ impl CacheMeter {
     fn len(&self) -> usize {
         self.inner.lock().entries.len()
     }
+}
+
+/// 解析布尔型环境变量：`0/off/false/no/disabled` 为假，其余非空为真，空串/未设置返回 None。
+fn bool_from_env(name: &str) -> Option<bool> {
+    let raw = std::env::var(name).ok()?;
+    let raw = raw.trim().to_ascii_lowercase();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(!matches!(
+        raw.as_str(),
+        "0" | "off" | "false" | "no" | "disabled"
+    ))
+}
+
+/// 解析 usize 型环境变量。解析失败、为 0、为空串一律视为「未表态」并 warn，不 panic。
+fn usize_from_env(name: &str) -> Option<usize> {
+    let raw = std::env::var(name).ok()?;
+    let raw = raw.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    match raw.parse::<usize>() {
+        Ok(0) => {
+            tracing::warn!("环境变量 {}=0 无效，已忽略并回落到默认值", name);
+            None
+        }
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!("环境变量 {}={:?} 不是合法正整数，已忽略", name, raw);
+            None
+        }
+    }
+}
+
+/// 解析 u64 型环境变量，口径与 `usize_from_env` 一致。
+fn u64_from_env(name: &str) -> Option<u64> {
+    usize_from_env(name).map(|v| v as u64)
 }
 
 fn now_secs() -> i64 {
@@ -826,7 +930,10 @@ fn resolve_breakpoints(
         let Some(auto_ttl) = validated_ttl(top_cc) else {
             return Vec::new();
         };
-        let target_idx = if blocks.iter().any(|b| !b.is_current_turn_input && b.cacheable) {
+        let target_idx = if blocks
+            .iter()
+            .any(|b| !b.is_current_turn_input && b.cacheable)
+        {
             blocks
                 .iter()
                 .enumerate()
@@ -2949,7 +3056,10 @@ mod tests {
         };
 
         let cache = CacheMeter::new(None);
-        assert_eq!(compute_cache_usage_sync(&cache, &make("aaa"), 0).cache_read, 0);
+        assert_eq!(
+            compute_cache_usage_sync(&cache, &make("aaa"), 0).cache_read,
+            0
+        );
         assert_eq!(
             compute_cache_usage_sync(&cache, &make("bbb"), 0).cache_read,
             0,
@@ -3247,5 +3357,94 @@ mod tests {
         assert_eq!(read, 100_000, "命中前缀必须全额如实上报");
         assert_eq!(creation, 0, "无新增覆盖段");
         assert_eq!(input, 1_000, "最新提问如实计入 input");
+    }
+
+    /// 测试内改环境变量会互相干扰，所有碰 env 的测试共用这把锁。
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn capacity_from_config_overrides_env() {
+        // config 显式值 > 环境变量 > 内置默认
+        assert_eq!(
+            CacheMeter::resolve_capacity(Some(8_192), Some(4_096)),
+            8_192
+        );
+        assert_eq!(CacheMeter::resolve_capacity(None, Some(4_096)), 4_096);
+        assert_eq!(CacheMeter::resolve_capacity(None, None), DEFAULT_CAPACITY);
+        assert_eq!(DEFAULT_CAPACITY, 262_144, "默认容量提高到 262144");
+    }
+
+    #[test]
+    fn capacity_invalid_env_falls_back_with_warning() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        for bad in ["abc", "0", "   ", "-1", "1.5"] {
+            unsafe {
+                std::env::set_var("KIRO_RS_CACHE_CAPACITY", bad);
+            }
+            assert_eq!(
+                CacheMeter::capacity_from_env(),
+                None,
+                "{bad:?} 应被视为未表态而不是 panic"
+            );
+        }
+        unsafe {
+            std::env::set_var("KIRO_RS_CACHE_CAPACITY", "20000");
+        }
+        assert_eq!(CacheMeter::capacity_from_env(), Some(20_000));
+        unsafe {
+            std::env::remove_var("KIRO_RS_CACHE_CAPACITY");
+        }
+        assert_eq!(CacheMeter::capacity_from_env(), None, "未设置时不表态");
+        // 未表态时回落默认
+        assert_eq!(
+            CacheMeter::resolve_capacity(None, CacheMeter::capacity_from_env()),
+            DEFAULT_CAPACITY
+        );
+    }
+
+    #[test]
+    fn capacity_out_of_range_is_clamped() {
+        assert_eq!(CacheMeter::resolve_capacity(Some(100), None), 1_024);
+        assert_eq!(
+            CacheMeter::resolve_capacity(Some(99_999_999), None),
+            8_388_608
+        );
+        assert_eq!(CacheMeter::resolve_capacity(None, Some(100)), 1_024);
+        assert_eq!(CacheMeter::resolve_capacity(Some(65_536), None), 65_536);
+    }
+
+    #[test]
+    fn flush_interval_clamped() {
+        assert_eq!(CacheMeter::resolve_flush_interval_secs(Some(1), None), 10);
+        assert_eq!(
+            CacheMeter::resolve_flush_interval_secs(Some(99_999), None),
+            3_600
+        );
+        assert_eq!(
+            CacheMeter::resolve_flush_interval_secs(None, Some(600)),
+            600
+        );
+        assert_eq!(
+            CacheMeter::resolve_flush_interval_secs(None, None),
+            DEFAULT_FLUSH_INTERVAL_SECS
+        );
+        assert_eq!(DEFAULT_FLUSH_INTERVAL_SECS, 300);
+    }
+
+    #[test]
+    fn persist_and_diagnostics_env_parsing() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("KIRO_RS_CACHE_PERSIST", "TRUE");
+            std::env::set_var("KIRO_RS_CACHE_MISS_DIAGNOSTICS", " off ");
+        }
+        assert_eq!(CacheMeter::persist_enabled_from_env(), Some(true));
+        assert_eq!(CacheMeter::miss_diagnostics_from_env(), Some(false));
+        unsafe {
+            std::env::remove_var("KIRO_RS_CACHE_PERSIST");
+            std::env::remove_var("KIRO_RS_CACHE_MISS_DIAGNOSTICS");
+        }
+        assert_eq!(CacheMeter::persist_enabled_from_env(), None);
+        assert_eq!(CacheMeter::miss_diagnostics_from_env(), None);
     }
 }
