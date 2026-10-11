@@ -49,6 +49,10 @@ const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 300;
 const MIN_FLUSH_INTERVAL_SECS: u64 = 10;
 /// 落盘间隔上限（秒）
 const MAX_FLUSH_INTERVAL_SECS: u64 = 3_600;
+/// 墓碑表硬上限。**不随 capacity 变化**：按 48 字节/条估算约 3MB 封顶。
+/// 超限整表清空，归因会在清空后的一小段时间里把本应 `miss_evicted` 的记成
+/// `miss_no_entry` —— 这是诊断信息，不影响计量正确性。
+const TOMBSTONE_CAPACITY: usize = 65_536;
 /// 最长 TTL（1h，与 Anthropic ttl=\"1h\" 对齐）
 const MAX_TTL_SECS: i64 = 3600;
 /// 默认 TTL（5min，ephemeral 默认值）
@@ -432,6 +436,8 @@ pub struct CacheMeter {
     enabled: std::sync::atomic::AtomicBool,
     /// 生效条目上限，构造后不变（改容量 = 改 config.json + 重启）
     capacity: usize,
+    /// miss 归因开关，构造后不变
+    miss_diagnostics: bool,
 }
 
 /// 单次查找的结果与 miss 归因。
@@ -445,6 +451,15 @@ pub enum LookupOutcome {
     Evicted,
     /// 表里没有、墓碑里也没有
     Absent,
+}
+
+/// 条目消失的原因，用于区分 `miss_evicted` / `miss_expired` / `miss_no_entry`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TombstoneKind {
+    /// 被容量水位淘汰
+    Evicted,
+    /// 被 TTL 过期清理
+    Expired,
 }
 
 /// 计量模拟的运行计数器快照。
@@ -494,6 +509,8 @@ struct Inner {
     dirty: bool,
     /// 运行计数器（已在 Mutex 保护下，不额外加锁）
     stats: Stats,
+    /// miss 归因墓碑表，上限 `TOMBSTONE_CAPACITY`；`miss_diagnostics` 关闭时恒为空
+    tombstones: HashMap<u64, TombstoneKind>,
 }
 
 impl CacheMeter {
@@ -532,6 +549,7 @@ impl CacheMeter {
             remote,
             enabled: std::sync::atomic::AtomicBool::new(true),
             capacity: DEFAULT_CAPACITY,
+            miss_diagnostics: true,
         }
     }
 
@@ -562,6 +580,20 @@ impl CacheMeter {
     /// 当前生效容量。
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// builder 风格设置 miss 归因开关。关闭后完全不建墓碑表，内存归零。
+    pub fn with_miss_diagnostics(mut self, enabled: bool) -> Self {
+        self.miss_diagnostics = enabled;
+        if !enabled {
+            self.inner.lock().tombstones.clear();
+        }
+        self
+    }
+
+    /// miss 归因是否开启。
+    pub fn miss_diagnostics(&self) -> bool {
+        self.miss_diagnostics
     }
 
     /// 读取 `KIRO_RS_CACHE_METERING` 环境变量表达的开关意图。
@@ -691,7 +723,11 @@ impl CacheMeter {
         let outcome = match probe {
             Some(Some(tokens)) => LookupOutcome::Hit(tokens),
             Some(None) => LookupOutcome::Expired,
-            None => LookupOutcome::Absent,
+            None => match inner.tombstones.get(&hash) {
+                Some(TombstoneKind::Expired) => LookupOutcome::Expired,
+                Some(TombstoneKind::Evicted) => LookupOutcome::Evicted,
+                None => LookupOutcome::Absent,
+            },
         };
 
         if matches!(outcome, LookupOutcome::Hit(_)) {
@@ -763,6 +799,7 @@ impl CacheMeter {
                 last_hit_at: now,
             },
         );
+        inner.tombstones.remove(&hash);
         inner.dirty = true;
         if inner.entries.len() > hard_limit(self.capacity) {
             self.shrink_to_watermark(&mut inner);
@@ -789,8 +826,10 @@ impl CacheMeter {
         // drop_n >= 1 由上面的早退保证，drop_n - 1 不会下溢
         victims.select_nth_unstable_by_key(drop_n - 1, |x| x.1);
         victims.truncate(drop_n);
+        let diagnostics = self.miss_diagnostics;
         for (k, _) in victims {
             inner.entries.remove(&k);
+            note_tombstone(inner, diagnostics, k, TombstoneKind::Evicted);
         }
         inner.stats.add(|s| &mut s.evicted_total, drop_n as u64);
         inner.dirty = true;
@@ -863,8 +902,10 @@ impl CacheMeter {
         if dead.is_empty() {
             return;
         }
+        let diagnostics = self.miss_diagnostics;
         for k in &dead {
             inner.entries.remove(k);
+            note_tombstone(&mut inner, diagnostics, *k, TombstoneKind::Expired);
         }
         inner.stats.add(|s| &mut s.expired_total, dead.len() as u64);
         inner.dirty = true;
@@ -879,6 +920,18 @@ impl CacheMeter {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// 记一条墓碑。超过硬上限时整表清空并把 `tombstone_clears` +1。
+fn note_tombstone(inner: &mut Inner, enabled: bool, hash: u64, kind: TombstoneKind) {
+    if !enabled {
+        return;
+    }
+    if inner.tombstones.len() >= TOMBSTONE_CAPACITY {
+        inner.tombstones.clear();
+        inner.stats.add(|s| &mut s.tombstone_clears, 1);
+    }
+    inner.tombstones.insert(hash, kind);
 }
 
 /// `record_entry` 的强制淘汰触发线：`capacity * 1.2`。
@@ -3784,5 +3837,93 @@ mod tests {
             cache.record_entry(100_000 + i, 1, 300);
         }
         assert!(cache.stats_total().evicted_total > 0, "强制淘汰应计数");
+    }
+
+    #[test]
+    fn shrink_records_evicted_tombstone() {
+        let cache = CacheMeter::new(None).with_capacity(MIN_CAPACITY);
+        for i in 0..(hard_limit(MIN_CAPACITY) as u64 + 1) {
+            cache.record_entry(i, 1, 300);
+        }
+        // 被淘汰的那批里至少有一个 hash 能查到 Evicted
+        let evicted_seen = (0..(hard_limit(MIN_CAPACITY) as u64 + 1))
+            .any(|i| cache.lookup_outcome(i) == LookupOutcome::Evicted);
+        assert!(evicted_seen, "容量淘汰应留下 Evicted 墓碑");
+    }
+
+    #[test]
+    fn evict_expired_records_expired_tombstone() {
+        let cache = CacheMeter::new(None);
+        cache.record_entry(5, 1, 60);
+        {
+            let mut inner = cache.inner.lock();
+            inner.entries.get_mut(&5).unwrap().expires_at = now_secs() - 1;
+        }
+        cache.evict_expired();
+        assert_eq!(cache.lookup_outcome(5), LookupOutcome::Expired);
+        assert_eq!(cache.stats_total().miss_expired, 1);
+    }
+
+    #[test]
+    fn tombstones_are_capped_and_cleared() {
+        let cache = CacheMeter::new(None).with_capacity(MIN_CAPACITY);
+        // 每轮插满越过硬顶，反复触发淘汰，累计淘汰量远超 TOMBSTONE_CAPACITY
+        let mut next: u64 = 0;
+        for _ in 0..80 {
+            for _ in 0..hard_limit(MIN_CAPACITY) {
+                cache.record_entry(next, 1, 300);
+                next += 1;
+            }
+        }
+        let inner = cache.inner.lock();
+        assert!(
+            inner.tombstones.len() <= TOMBSTONE_CAPACITY,
+            "墓碑表必须有硬上限，实际 {}",
+            inner.tombstones.len()
+        );
+        assert!(
+            inner.stats.total.tombstone_clears >= 1,
+            "超限应整表清空并计数"
+        );
+    }
+
+    #[test]
+    fn miss_diagnostics_disabled_keeps_tombstones_empty() {
+        let cache = CacheMeter::new(None)
+            .with_capacity(MIN_CAPACITY)
+            .with_miss_diagnostics(false);
+        for i in 0..(hard_limit(MIN_CAPACITY) as u64 + 1) {
+            cache.record_entry(i, 1, 300);
+        }
+        assert!(cache.inner.lock().tombstones.is_empty(), "关闭后不建墓碑表");
+        // 被淘汰的条目退化为 Absent
+        let evicted_seen = (0..(hard_limit(MIN_CAPACITY) as u64 + 1))
+            .any(|i| cache.lookup_outcome(i) == LookupOutcome::Evicted);
+        assert!(!evicted_seen, "关闭后不应产出 Evicted");
+        assert!(
+            cache.stats_total().miss_no_entry > 0,
+            "退化为 miss_no_entry"
+        );
+        assert_eq!(cache.stats_total().miss_evicted, 0);
+    }
+
+    /// Review Focus 5：条目被重新写入后，同 hash 的旧墓碑必须消失。
+    #[test]
+    fn record_entry_clears_stale_tombstone() {
+        let cache = CacheMeter::new(None);
+        cache.record_entry(42, 1, 60);
+        {
+            let mut inner = cache.inner.lock();
+            inner.entries.get_mut(&42).unwrap().expires_at = now_secs() - 1;
+        }
+        cache.evict_expired();
+        assert_eq!(cache.lookup_outcome(42), LookupOutcome::Expired);
+
+        cache.record_entry(42, 99, 300);
+        assert_eq!(cache.lookup_outcome(42), LookupOutcome::Hit(99));
+        assert!(
+            !cache.inner.lock().tombstones.contains_key(&42),
+            "重新写入后旧墓碑必须被删除，否则下次淘汰归因会串"
+        );
     }
 }
