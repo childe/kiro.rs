@@ -434,11 +434,66 @@ pub struct CacheMeter {
     capacity: usize,
 }
 
+/// 单次查找的结果与 miss 归因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupOutcome {
+    /// 命中且已滑动续期
+    Hit(u32),
+    /// 条目还在表里但已过期，或命中 `Expired` 墓碑
+    Expired,
+    /// 命中 `Evicted` 墓碑：条目曾存在，被容量淘汰
+    Evicted,
+    /// 表里没有、墓碑里也没有
+    Absent,
+}
+
+/// 计量模拟的运行计数器快照。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatsSnapshot {
+    pub hits: u64,
+    pub misses: u64,
+    pub miss_no_entry: u64,
+    pub miss_expired: u64,
+    pub miss_evicted: u64,
+    pub miss_no_breakpoint: u64,
+    pub miss_no_seed: u64,
+    pub evicted_total: u64,
+    pub expired_total: u64,
+    pub tombstone_clears: u64,
+}
+
+impl StatsSnapshot {
+    /// 本周期是否完全没有事情发生（用于抑制空转日志）。
+    pub fn is_all_zero(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// 同时维护「本周期增量」与「进程累计」两份计数。
+#[derive(Default)]
+struct Stats {
+    total: StatsSnapshot,
+    delta: StatsSnapshot,
+}
+
+impl Stats {
+    fn add(&mut self, pick: fn(&mut StatsSnapshot) -> &mut u64, n: u64) {
+        *pick(&mut self.total) = pick(&mut self.total).saturating_add(n);
+        *pick(&mut self.delta) = pick(&mut self.delta).saturating_add(n);
+    }
+
+    fn take_delta(&mut self) -> StatsSnapshot {
+        std::mem::take(&mut self.delta)
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     entries: HashMap<u64, CacheEntry>,
     /// 自上次落盘后是否有变化
     dirty: bool,
+    /// 运行计数器（已在 Mutex 保护下，不额外加锁）
+    stats: Stats,
 }
 
 impl CacheMeter {
@@ -611,11 +666,17 @@ impl CacheMeter {
         Self::with_remote(persist_path, remote)
     }
 
-    /// 查询单个哈希是否在缓存中且未过期。若命中则进行滑动续期（按 entry 自身 TTL），并返回 tokens。
-    pub fn lookup_and_renew(&self, hash: u64) -> Option<u32> {
+    /// 探测单个哈希，返回命中结果与 miss 归因。命中时按 entry 自身 TTL 滑动续期。
+    ///
+    /// **不碰任何计数器**：lookback 一个断点要探测多达 20 个 hash，
+    /// 逐个记账会把「一次成功命中」记成「多条 miss + 一条 hit」。
+    /// 业务计数统一由调用方在断点结束后调一次 `note_lookup`。
+    fn probe_outcome(&self, hash: u64) -> LookupOutcome {
         let now = now_secs();
         let mut inner = self.inner.lock();
-        let tokens = if let Some(entry) = inner.entries.get_mut(&hash) {
+
+        // 先结束对 entries 的可变借用，再去碰 tombstones / stats
+        let probe = inner.entries.get_mut(&hash).map(|entry| {
             if entry.expires_at > now {
                 let ttl = entry.ttl_secs.clamp(60, MAX_TTL_SECS);
                 entry.ttl_secs = ttl;
@@ -625,13 +686,67 @@ impl CacheMeter {
             } else {
                 None
             }
-        } else {
-            None
+        });
+
+        let outcome = match probe {
+            Some(Some(tokens)) => LookupOutcome::Hit(tokens),
+            Some(None) => LookupOutcome::Expired,
+            None => LookupOutcome::Absent,
         };
-        if tokens.is_some() {
+
+        if matches!(outcome, LookupOutcome::Hit(_)) {
             inner.dirty = true;
         }
-        tokens
+
+        outcome
+    }
+
+    /// 给**一次业务查找**记一次账：命中记 1 次 `hits`，未命中按原因记 1 次
+    /// `misses` + 对应分项。一个断点无论探测过多少个 hash，只调用一次。
+    pub fn note_lookup(&self, outcome: LookupOutcome) {
+        let mut inner = self.inner.lock();
+        match outcome {
+            LookupOutcome::Hit(_) => inner.stats.add(|s| &mut s.hits, 1),
+            LookupOutcome::Expired => {
+                inner.stats.add(|s| &mut s.misses, 1);
+                inner.stats.add(|s| &mut s.miss_expired, 1);
+            }
+            LookupOutcome::Evicted => {
+                inner.stats.add(|s| &mut s.misses, 1);
+                inner.stats.add(|s| &mut s.miss_evicted, 1);
+            }
+            LookupOutcome::Absent => {
+                inner.stats.add(|s| &mut s.misses, 1);
+                inner.stats.add(|s| &mut s.miss_no_entry, 1);
+            }
+        }
+    }
+
+    /// 查一个哈希并记一次账。单 hash 查找（含 `lookup_and_renew`）走这里；
+    /// 多 hash 回溯探测请用 `probe_outcome` + 末尾一次 `note_lookup`。
+    pub fn lookup_outcome(&self, hash: u64) -> LookupOutcome {
+        let outcome = self.probe_outcome(hash);
+        self.note_lookup(outcome);
+        outcome
+    }
+
+    /// 查询单个哈希是否在缓存中且未过期。命中则滑动续期并返回 tokens。
+    /// 归因信息请用 `lookup_outcome`。
+    pub fn lookup_and_renew(&self, hash: u64) -> Option<u32> {
+        match self.lookup_outcome(hash) {
+            LookupOutcome::Hit(tokens) => Some(tokens),
+            _ => None,
+        }
+    }
+
+    /// 进程累计计数器快照。
+    pub fn stats_total(&self) -> StatsSnapshot {
+        self.inner.lock().stats.total
+    }
+
+    /// 取走本周期增量并清零（周期性日志用）。
+    pub fn take_stats_delta(&self) -> StatsSnapshot {
+        self.inner.lock().stats.take_delta()
     }
 
     /// 写入单个断点条目，按指定的 ttl_secs 设置过期时间
@@ -677,6 +792,7 @@ impl CacheMeter {
         for (k, _) in victims {
             inner.entries.remove(&k);
         }
+        inner.stats.add(|s| &mut s.evicted_total, drop_n as u64);
         inner.dirty = true;
     }
 
@@ -738,11 +854,20 @@ impl CacheMeter {
     pub fn evict_expired(&self) {
         let now = now_secs();
         let mut inner = self.inner.lock();
-        let before = inner.entries.len();
-        inner.entries.retain(|_, v| v.expires_at > now);
-        if inner.entries.len() != before {
-            inner.dirty = true;
+        let dead: Vec<u64> = inner
+            .entries
+            .iter()
+            .filter(|(_, v)| v.expires_at <= now)
+            .map(|(k, _)| *k)
+            .collect();
+        if dead.is_empty() {
+            return;
         }
+        for k in &dead {
+            inner.entries.remove(k);
+        }
+        inner.stats.add(|s| &mut s.expired_total, dead.len() as u64);
+        inner.dirty = true;
     }
 
     /// 当前表内条目数（含已过期但尚未被清理的）。
@@ -3600,5 +3725,64 @@ mod tests {
             tiny.shrink_to_watermark(&mut inner);
         }
         assert_eq!(tiny.len(), target, "drop_n == 1 的边界必须正好清掉一条");
+    }
+
+    #[test]
+    fn lookup_outcome_expired_vs_absent() {
+        let cache = CacheMeter::new(None);
+        assert_eq!(cache.lookup_outcome(1), LookupOutcome::Absent, "从未写过");
+        cache.record_entry(1, 7, 300);
+        assert_eq!(cache.lookup_outcome(1), LookupOutcome::Hit(7));
+        {
+            let mut inner = cache.inner.lock();
+            inner.entries.get_mut(&1).unwrap().expires_at = now_secs() - 1;
+        }
+        assert_eq!(
+            cache.lookup_outcome(1),
+            LookupOutcome::Expired,
+            "表里还在但已过期"
+        );
+    }
+
+    #[test]
+    fn stats_counters_accumulate_on_hit_and_miss() {
+        let cache = CacheMeter::new(None);
+        assert_eq!(cache.lookup_and_renew(1), None);
+        cache.record_entry(1, 10, 300);
+        assert_eq!(cache.lookup_and_renew(1), Some(10));
+
+        let stats = cache.stats_total();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.miss_no_entry, 1);
+        assert_eq!(stats.miss_expired, 0);
+    }
+
+    #[test]
+    fn stats_delta_resets_but_total_keeps() {
+        let cache = CacheMeter::new(None);
+        assert_eq!(cache.lookup_and_renew(1), None);
+        let first = cache.take_stats_delta();
+        assert_eq!(first.misses, 1);
+        let second = cache.take_stats_delta();
+        assert!(second.is_all_zero(), "增量取走后应清零");
+        assert_eq!(cache.stats_total().misses, 1, "累计量不随增量清零");
+    }
+
+    #[test]
+    fn evict_and_shrink_bump_totals() {
+        let cache = CacheMeter::new(None).with_capacity(MIN_CAPACITY);
+        cache.record_entry(1, 5, 60);
+        {
+            let mut inner = cache.inner.lock();
+            inner.entries.get_mut(&1).unwrap().expires_at = now_secs() - 1;
+        }
+        cache.evict_expired();
+        assert_eq!(cache.stats_total().expired_total, 1);
+
+        for i in 0..(hard_limit(MIN_CAPACITY) as u64 + 1) {
+            cache.record_entry(100_000 + i, 1, 300);
+        }
+        assert!(cache.stats_total().evicted_total > 0, "强制淘汰应计数");
     }
 }
