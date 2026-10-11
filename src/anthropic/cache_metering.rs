@@ -810,6 +810,7 @@ impl CacheMeter {
 
     /// 查一个哈希并记一次账。单 hash 查找（含 `lookup_and_renew`）走这里；
     /// 多 hash 回溯探测请用 `probe_outcome` + 末尾一次 `note_lookup`。
+    #[allow(dead_code)]
     pub fn lookup_outcome(&self, hash: u64) -> LookupOutcome {
         let outcome = self.probe_outcome(hash);
         self.note_lookup(outcome);
@@ -818,6 +819,7 @@ impl CacheMeter {
 
     /// 查询单个哈希是否在缓存中且未过期。命中则滑动续期并返回 tokens。
     /// 归因信息请用 `lookup_outcome`。
+    #[allow(dead_code)]
     pub fn lookup_and_renew(&self, hash: u64) -> Option<u32> {
         match self.lookup_outcome(hash) {
             LookupOutcome::Hit(tokens) => Some(tokens),
@@ -831,6 +833,7 @@ impl CacheMeter {
     }
 
     /// 取走本周期增量并清零（周期性日志用）。
+    #[allow(dead_code)]
     pub fn take_stats_delta(&self) -> StatsSnapshot {
         self.inner.lock().stats.take_delta()
     }
@@ -1013,6 +1016,7 @@ impl CacheMeter {
     }
 
     /// 表是否为空（clippy 要求与 `len` 成对）。
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
