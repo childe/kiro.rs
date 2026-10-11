@@ -49,6 +49,8 @@ const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 300;
 const MIN_FLUSH_INTERVAL_SECS: u64 = 10;
 /// 落盘间隔上限（秒）
 const MAX_FLUSH_INTERVAL_SECS: u64 = 3_600;
+/// 后台巡检周期（秒）：清过期 + 水位检查 + 指标输出。与落盘间隔无关。
+const SWEEP_INTERVAL_SECS: u64 = 60;
 /// 墓碑表硬上限。**不随 capacity 变化**：按 48 字节/条估算约 3MB 封顶。
 /// 超限整表清空，归因会在清空后的一小段时间里把本应 `miss_evicted` 的记成
 /// `miss_no_entry` —— 这是诊断信息，不影响计量正确性。
@@ -438,6 +440,8 @@ pub struct CacheMeter {
     capacity: usize,
     /// miss 归因开关，构造后不变
     miss_diagnostics: bool,
+    /// 落盘间隔（秒），构造后不变
+    flush_interval_secs: u64,
 }
 
 /// 单次查找的结果与 miss 归因。
@@ -550,6 +554,7 @@ impl CacheMeter {
             enabled: std::sync::atomic::AtomicBool::new(true),
             capacity: DEFAULT_CAPACITY,
             miss_diagnostics: true,
+            flush_interval_secs: DEFAULT_FLUSH_INTERVAL_SECS,
         }
     }
 
@@ -594,6 +599,51 @@ impl CacheMeter {
     /// miss 归因是否开启。
     pub fn miss_diagnostics(&self) -> bool {
         self.miss_diagnostics
+    }
+
+    /// builder 风格设置落盘间隔（秒），自动钳到 `[10, 3600]`。
+    pub fn with_flush_interval_secs(mut self, secs: u64) -> Self {
+        self.flush_interval_secs = secs.clamp(MIN_FLUSH_INTERVAL_SECS, MAX_FLUSH_INTERVAL_SECS);
+        self
+    }
+
+    /// 当前生效的落盘间隔（秒）。
+    pub fn flush_interval_secs(&self) -> u64 {
+        self.flush_interval_secs
+    }
+
+    /// 是否开启磁盘快照。关闭即 `persist_path == None`：
+    /// 启动不读文件、运行不写文件、退出不写文件，也不删除已有文件。
+    pub fn persist_enabled(&self) -> bool {
+        self.persist_path.is_some()
+    }
+
+    /// 输出本周期增量指标。本周期无任何增量时不输出，避免空转刷屏。
+    pub fn log_stats_delta(&self) {
+        let (entries_len, delta) = {
+            let mut inner = self.inner.lock();
+            (inner.entries.len(), inner.stats.take_delta())
+        };
+        if delta.is_all_zero() {
+            return;
+        }
+        tracing::info!(
+            "cache_meter stats entries_len={} capacity={} hits={} misses={} evicted={} expired={} \
+             miss_no_entry={} miss_expired={} miss_evicted={} miss_no_breakpoint={} \
+             miss_no_seed={} tombstone_clears={}",
+            entries_len,
+            self.capacity,
+            delta.hits,
+            delta.misses,
+            delta.evicted_total,
+            delta.expired_total,
+            delta.miss_no_entry,
+            delta.miss_expired,
+            delta.miss_evicted,
+            delta.miss_no_breakpoint,
+            delta.miss_no_seed,
+            delta.tombstone_clears,
+        );
     }
 
     /// 读取 `KIRO_RS_CACHE_METERING` 环境变量表达的开关意图。
@@ -894,16 +944,42 @@ impl CacheMeter {
         }
     }
 
-    /// 启动后台周期任务：定期 flush + 清理过期条目
+    /// 启动后台周期任务。
+    ///
+    /// **两个互相独立的定时器**：
+    /// - 巡检 `SWEEP_INTERVAL_SECS`（60 秒）一轮，做「清过期 + 水位检查 + 指标输出」；
+    /// - 落盘按 `flush_interval_secs`（10–3600 秒）自己计时。
+    ///
+    /// 不把落盘挂在巡检轮里判断「距上次够久没有」：那样 10 秒的配置实际最快 60 秒
+    /// 才落一次、90 秒的配置实际 120 秒，与对外声明的可配置区间不符。
+    /// 落盘关闭时该分支用 `select!` 的条件直接禁用，定时器不参与竞争。
     pub fn spawn_background(self: Arc<Self>) {
+        let sweep_period = std::time::Duration::from_secs(SWEEP_INTERVAL_SECS);
+        let flush_period = std::time::Duration::from_secs(self.flush_interval_secs);
+        let persist = self.persist_enabled();
         let weak = Arc::downgrade(&self);
+        drop(self);
         tokio::spawn(async move {
-            let interval = std::time::Duration::from_secs(60);
+            let mut sweep_tick = tokio::time::interval(sweep_period);
+            let mut flush_tick = tokio::time::interval(flush_period);
+            // interval 的第一次 tick 立刻返回，先吃掉，避免启动瞬间就落一次盘
+            sweep_tick.tick().await;
+            flush_tick.tick().await;
+            // 落后时补齐而不是追打一串 tick（进程被挂起/机器休眠后尤其重要）
+            sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                tokio::time::sleep(interval).await;
-                let Some(cache) = weak.upgrade() else { return };
-                cache.sweep();
-                cache.flush_to_disk();
+                tokio::select! {
+                    _ = sweep_tick.tick() => {
+                        let Some(cache) = weak.upgrade() else { return };
+                        cache.sweep();
+                        cache.log_stats_delta();
+                    }
+                    _ = flush_tick.tick(), if persist => {
+                        let Some(cache) = weak.upgrade() else { return };
+                        cache.flush_to_disk();
+                    }
+                }
             }
         });
     }
@@ -4171,5 +4247,147 @@ mod tests {
         let after = cache.stats_total();
         assert_eq!(after.hits, before.hits + 1);
         assert_eq!(after.misses, before.misses);
+    }
+
+    #[test]
+    fn persist_disabled_does_not_read_or_write_file() {
+        let tmp = std::env::temp_dir().join(format!(
+            "kiro-pc-off-{}-{}.json",
+            now_secs(),
+            fastrand::u64(..)
+        ));
+        // 预置一份有效快照
+        let seeded = CacheMeter::new(Some(tmp.clone()));
+        seeded.record_entry(7, 42, 600);
+        seeded.flush_to_disk();
+        let before = std::fs::read(&tmp).expect("预置快照应存在");
+        assert!(!before.is_empty());
+
+        // persist 关闭（persist_path = None）：不读
+        let off = CacheMeter::new(None);
+        assert_eq!(off.len(), 0, "关闭后启动不应加载任何条目");
+        assert!(!off.persist_enabled());
+
+        // 不写：跑完一轮落盘后文件字节不变
+        off.record_entry(1, 1, 300);
+        off.flush_to_disk();
+        let after = std::fs::read(&tmp).expect("关闭后不得删除已有文件");
+        assert_eq!(before, after, "关闭后不得改写已有快照文件");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Review Focus 1：快照格式不变，旧版本写的文件必须仍能加载。
+    #[test]
+    fn legacy_snapshot_format_still_loads() {
+        let tmp = std::env::temp_dir().join(format!(
+            "kiro-pc-legacy-{}-{}.json",
+            now_secs(),
+            fastrand::u64(..)
+        ));
+        let future = now_secs() + 600;
+        let legacy = format!(
+            r#"{{"7":{{"tokens":42,"ttl_secs":600,"expires_at":{future},"last_hit_at":{future}}}}}"#
+        );
+        std::fs::write(&tmp, legacy).unwrap();
+
+        let cache = CacheMeter::new(Some(tmp.clone()));
+        assert_eq!(
+            cache.lookup_and_renew(7),
+            Some(42),
+            "旧格式快照必须仍能加载：序列化结构只含 entries"
+        );
+
+        // 回写后仍是同一结构（顶层对象的值里不得出现 tombstones / stats）
+        cache.record_entry(8, 1, 300);
+        cache.flush_to_disk();
+        let raw = std::fs::read_to_string(&tmp).unwrap();
+        assert!(!raw.contains("tombstones"), "墓碑不得落盘");
+        assert!(!raw.contains("miss_no_entry"), "计数器不得落盘");
+        let reread = CacheMeter::new(Some(tmp.clone()));
+        assert_eq!(reread.lookup_and_renew(8), Some(1));
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn flush_interval_builder_round_trips() {
+        let cache = CacheMeter::new(None).with_flush_interval_secs(600);
+        assert_eq!(cache.flush_interval_secs(), 600);
+        // 钳制：builder 自身也兜一次底
+        let low = CacheMeter::new(None).with_flush_interval_secs(1);
+        assert_eq!(low.flush_interval_secs(), MIN_FLUSH_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn log_stats_delta_consumes_the_delta() {
+        let cache = CacheMeter::new(None);
+        assert_eq!(cache.lookup_and_renew(1), None);
+        cache.log_stats_delta();
+        assert!(cache.take_stats_delta().is_all_zero(), "输出后增量应被清零");
+        assert_eq!(cache.stats_total().misses, 1, "累计量保留");
+    }
+
+    /// 落盘定时器必须独立于 60 秒巡检：配 10 秒就要在 10 秒量级落盘，
+    /// 配 90 秒就要在 90 秒落盘（而不是被巡检对齐到 60/120 秒）。
+    /// 用 tokio 的虚拟时钟，不真的等。
+    async fn flush_count_within(interval_secs: u64, advance_secs: u64, persist: bool) -> usize {
+        let tmp = std::env::temp_dir().join(format!(
+            "kiro-pc-sched-{}-{}-{}.json",
+            interval_secs,
+            advance_secs,
+            fastrand::u64(..)
+        ));
+        let path = if persist { Some(tmp.clone()) } else { None };
+        let cache = Arc::new(CacheMeter::new(path).with_flush_interval_secs(interval_secs));
+        cache.record_entry(1, 10, 3_600);
+        cache.clone().spawn_background();
+
+        let mut writes = 0usize;
+        let mut last: Option<std::time::SystemTime> = None;
+        let mut seen = false;
+        for _ in 0..advance_secs {
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            // 让后台任务有机会被调度
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            if let Ok(meta) = std::fs::metadata(&tmp) {
+                let mtime = meta.modified().ok();
+                if !seen || mtime != last {
+                    writes += 1;
+                    seen = true;
+                    last = mtime;
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&tmp);
+        writes
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_timer_is_independent_of_sweep_period() {
+        // 10 秒间隔：在 50 秒内（第一次巡检都还没到）必须已经落过盘
+        assert!(
+            flush_count_within(10, 50, true).await >= 1,
+            "flush_interval=10 不应被 60 秒巡检拖到 60 秒后才落盘"
+        );
+        // 90 秒间隔：100 秒内应恰好落过一次（而不是被对齐到 120 秒）
+        assert!(
+            flush_count_within(90, 100, true).await >= 1,
+            "flush_interval=90 应在 90 秒落盘，而不是 120 秒"
+        );
+        // 300 秒（默认）：200 秒内不该落盘
+        assert_eq!(
+            flush_count_within(300, 200, true).await,
+            0,
+            "flush_interval=300 在 200 秒内不该落盘"
+        );
+        // 关闭持久化：无论多久都不落盘
+        assert_eq!(
+            flush_count_within(10, 200, false).await,
+            0,
+            "persist 关闭时落盘分支必须完全不执行"
+        );
     }
 }
