@@ -633,12 +633,43 @@ pub struct SetLogGovernanceConfigRequest {
     pub usage_log_retention_days: Option<u32>,
 }
 
+/// prompt cache 本地计量模拟的运行计数器（进程累计值）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheMeteringStatsResponse {
+    /// 当前表内条目数（瞬时值）
+    pub entries_len: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub miss_no_entry: u64,
+    pub miss_expired: u64,
+    pub miss_evicted: u64,
+    pub miss_no_breakpoint: u64,
+    pub miss_no_seed: u64,
+    pub evicted_total: u64,
+    pub expired_total: u64,
+    pub tombstone_clears: u64,
+}
+
 /// prompt cache 本地计量模拟配置响应。
+///
+/// 除 `enabled` 外均为**只读**：容量、落盘开关、落盘间隔、miss 诊断开关
+/// 启动时固定，改这些等于改 `config.json` + 重启。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheMeteringConfigResponse {
     /// 计量模拟是否启用
     pub enabled: bool,
+    /// 生效条目上限
+    pub capacity: usize,
+    /// 是否落盘快照
+    pub persist_enabled: bool,
+    /// 落盘间隔（秒）
+    pub flush_interval_secs: u64,
+    /// miss 归因是否开启
+    pub miss_diagnostics: bool,
+    /// 运行计数器；运行时句柄缺失时为 `null`
+    pub stats: Option<CacheMeteringStatsResponse>,
 }
 
 /// prompt cache 本地计量模拟配置更新请求。
