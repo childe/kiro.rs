@@ -27,6 +27,9 @@
 - 磁盘快照格式**仍为 JSON，仍只序列化 `entries`**（`HashMap<u64, CacheEntry>`），墓碑与计数器不落盘。
 - `src/anthropic/cache_metering.rs` 现有测试**不得改断言**，必须保持通过。
 - 每个任务结束前：`cargo fmt`、`cargo clippy -- -D warnings` 无新增告警、`cargo test` 全绿。
+- 本仓库**没有 library target**（`Cargo.toml` 无 `[lib]`、无 `src/lib.rs`），只有 bin `kiro-rs`。所有测试命令一律写成 `cargo test --bin kiro-rs <过滤条件>`；`cargo test --lib` 会直接报 `no library targets found` 而不是跑测试。
+- 测试/构建命令**不得接 `| tail`**：管道会把 Cargo 的非零退出码吞成 `tail` 的 0，失败被当成通过。需要截断输出时用 `set -o pipefail`，或先看退出码再截断。
+- miss 计数口径（Task 3 定规则、Task 5 接线，两者是同一个验收单元）：**一个断点无论 lookback 探测多少个 hash，只记一次账** —— 命中记 1 次 `hits`，全部落空记 1 次 `misses` 并按最深那个 hash 的 `deepest_reason` 分类。底层探测用不计数的 `probe_outcome`，业务计数走 `note_lookup`。
 
 ## Review Focus
 
@@ -142,7 +145,7 @@
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test --lib cache_metering::tests::capacity_ 2>&1 | tail -20`
+Run: `cargo test --bin kiro-rs cache_metering::tests::capacity_`
 Expected: 编译失败，`no function or associated item named 'resolve_capacity' found`。
 
 - [ ] **Step 3: 实现常量与解析函数**
@@ -335,12 +338,12 @@ fn u64_from_env(name: &str) -> Option<u64> {
 
 - [ ] **Step 5: 跑测试确认通过**
 
-Run: `cargo test --lib cache_metering 2>&1 | tail -20`
+Run: `cargo test --bin kiro-rs cache_metering`
 Expected: 全部 PASS（含现有测试；`DEFAULT_CAPACITY` 改大不影响任何现有断言，因为现有测试都不到 4096 条）。
 
 - [ ] **Step 6: 格式化与静态检查**
 
-Run: `cargo fmt && cargo clippy --all-targets -- -D warnings 2>&1 | tail -20`
+Run: `cargo fmt && cargo clippy --all-targets -- -D warnings`
 Expected: 无告警。
 
 - [ ] **Step 7: Commit**
@@ -375,66 +378,73 @@ git commit -m "feat(cache): add configurable CacheMeter capacity/persist/flush/d
 
 ```rust
     /// 构造一个容量确定、last_hit_at 可控的 meter。
+    ///
+    /// 注意：`with_capacity` 自己会把入参钳到 `[MIN_CAPACITY, MAX_CAPACITY]`，
+    /// 所以这里只能传 **≥ 1024** 的合法容量。下面统一用 2000：
+    /// `hard_limit = 2400`、`watermark = 1800`。
     fn meter_with_capacity(capacity: usize) -> CacheMeter {
-        CacheMeter::new(None).with_capacity(capacity)
+        let cache = CacheMeter::new(None).with_capacity(capacity);
+        assert_eq!(cache.capacity(), capacity, "测试容量必须落在合法区间内");
+        cache
     }
 
     #[test]
     fn record_entry_does_not_evict_below_hard_ratio() {
-        let cache = meter_with_capacity(1_000);
-        for i in 0..1_150u64 {
+        let cache = meter_with_capacity(2_000);
+        for i in 0..2_300u64 {
             cache.record_entry(i, 1, 300);
         }
-        assert_eq!(cache.len(), 1_150, "未越过 1.2C 硬顶，不应强制淘汰");
+        assert_eq!(cache.len(), 2_300, "未越过 1.2C(=2400) 硬顶，不应强制淘汰");
     }
 
     #[test]
     fn record_entry_shrinks_to_watermark_above_hard_ratio() {
-        let cache = meter_with_capacity(1_000);
-        for i in 0..1_201u64 {
+        let cache = meter_with_capacity(2_000);
+        for i in 0..2_401u64 {
             cache.record_entry(i, 1, 300);
         }
-        assert_eq!(cache.len(), 900, "越过 1.2C 应一次清到 0.9C");
+        assert_eq!(cache.len(), 1_800, "越过 1.2C(=2400) 应一次清到 0.9C(=1800)");
     }
 
     #[test]
     fn shrink_evicts_least_recently_hit_first() {
-        let cache = meter_with_capacity(1_000);
-        for i in 0..1_200u64 {
+        let cache = meter_with_capacity(2_000);
+        for i in 0..2_400u64 {
             cache.record_entry(i, 1, 300);
         }
-        // 淘汰量正好是 301（1201 - 0.9*1000），所以「很久以前」那组也要正好 301 条，
-        // 否则 last_hit_at 相同的条目之间会出现不确定的 tie-break，断言不稳。
-        // 0..899 标成最近命中（899 条），899..1200 标成很久以前（301 条）。
+        // 下面再插一条就是 2401 条，淘汰量正好 601（2401 - 0.9*2000），
+        // 所以「很久以前」那组也要正好 601 条，否则 last_hit_at 相同的条目之间
+        // 会出现不确定的 tie-break，断言不稳。
+        // 0..1799 标成最近命中（1799 条），1799..2400 标成很久以前（601 条）。
         {
             let mut inner = cache.inner.lock();
             let now = now_secs();
             for (k, v) in inner.entries.iter_mut() {
-                v.last_hit_at = if *k < 899 { now } else { now - 10_000 };
+                v.last_hit_at = if *k < 1_799 { now } else { now - 10_000 };
             }
         }
-        // 再插一条（last_hit_at = now，属于最近组）越过 1.2C 硬顶：1201 > 1200
+        // 再插一条（last_hit_at = now，属于最近组）越过 1.2C 硬顶：2401 > 2400
         cache.record_entry(9_999, 1, 300);
-        assert_eq!(cache.len(), 900);
+        assert_eq!(cache.len(), 1_800);
         let inner = cache.inner.lock();
-        for k in 0..899u64 {
+        for k in 0..1_799u64 {
             assert!(inner.entries.contains_key(&k), "最近命中的 {k} 不该被淘汰");
         }
         assert!(inner.entries.contains_key(&9_999), "刚写入的条目不该被淘汰");
-        for k in 899..1_200u64 {
+        for k in 1_799..2_400u64 {
             assert!(!inner.entries.contains_key(&k), "最久未命中的 {k} 应被淘汰");
         }
     }
 
     #[test]
     fn background_sweep_shrinks_above_capacity() {
-        let cache = meter_with_capacity(1_000);
-        for i in 0..1_100u64 {
+        let cache = meter_with_capacity(2_000);
+        for i in 0..2_100u64 {
             cache.record_entry(i, 1, 300);
         }
-        assert_eq!(cache.len(), 1_100, "1.0C~1.2C 之间 record_entry 不动手");
+        assert_eq!(cache.len(), 2_100, "1.0C~1.2C 之间 record_entry 不动手");
         cache.sweep();
-        assert_eq!(cache.len(), 900, "后台巡检应把超过 1.0C 的表清到 0.9C");
+        assert_eq!(cache.len(), 1_800, "后台巡检应把超过 1.0C 的表清到 0.9C");
     }
 
     /// Review Focus 2：capacity 取下限时 drop_n-1 == 0 与 saturating_mul 的边界。
@@ -449,19 +459,27 @@ git commit -m "feat(cache): add configurable CacheMeter capacity/persist/flush/d
         // 上限不溢出
         assert_eq!(hard_limit(MAX_CAPACITY), MAX_CAPACITY * 6 / 5);
         assert_eq!(hard_limit(usize::MAX), usize::MAX / 5);
-        // 单条越过水位时 drop_n == 1，select_nth_unstable_by_key(0, ..) 必须合法
+        // 单条越过水位时 drop_n == 1，select_nth_unstable_by_key(0, ..) 必须合法。
+        // 注意不能用 sweep()：len = watermark + 1 = 922 还没超过 capacity(1024)，
+        // sweep 会直接早退、根本不触发淘汰，覆盖不到这个边界。必须直接调
+        // shrink_to_watermark（同模块子 mod，可访问私有方法）。
         let tiny = meter_with_capacity(MIN_CAPACITY);
-        for i in 0..(MIN_CAPACITY / 10 * 9 + 1) as u64 {
+        let target = watermark(MIN_CAPACITY);
+        for i in 0..(target + 1) as u64 {
             tiny.record_entry(i, 1, 300);
         }
-        tiny.sweep();
-        assert!(tiny.len() <= MIN_CAPACITY);
+        assert_eq!(tiny.len(), target + 1, "此时还没到 capacity，不该自发淘汰");
+        {
+            let mut inner = tiny.inner.lock();
+            tiny.shrink_to_watermark(&mut inner);
+        }
+        assert_eq!(tiny.len(), target, "drop_n == 1 的边界必须正好清掉一条");
     }
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test --lib cache_metering::tests::record_entry_ 2>&1 | tail -20`
+Run: `cargo test --bin kiro-rs cache_metering::tests::record_entry_`
 Expected: 编译失败，`no method named 'with_capacity'`。
 
 - [ ] **Step 3: 实现结构字段与水位淘汰**
@@ -589,12 +607,12 @@ fn watermark(capacity: usize) -> usize {
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cargo test --lib cache_metering 2>&1 | tail -20`
+Run: `cargo test --bin kiro-rs cache_metering`
 Expected: 全部 PASS。
 
 - [ ] **Step 5: 格式化与静态检查**
 
-Run: `cargo fmt && cargo clippy --all-targets -- -D warnings 2>&1 | tail -20`
+Run: `cargo fmt && cargo clippy --all-targets -- -D warnings`
 Expected: 无告警。
 
 - [ ] **Step 6: Commit**
@@ -618,7 +636,9 @@ git commit -m "perf(cache): replace per-insert full sort with O(n) watermark evi
   - `pub enum LookupOutcome { Hit(u32), Expired, Evicted, Absent }`（`Debug + Clone + Copy + PartialEq + Eq`）
   - `pub struct StatsSnapshot`（`Debug + Clone + Copy + Default + PartialEq + Eq`），字段 `hits, misses, miss_no_entry, miss_expired, miss_evicted, miss_no_breakpoint, miss_no_seed, evicted_total, expired_total, tombstone_clears: u64`
   - `StatsSnapshot::is_all_zero(&self) -> bool`
-  - `CacheMeter::lookup_outcome(&self, hash: u64) -> LookupOutcome`
+  - `CacheMeter::probe_outcome(&self, hash: u64) -> LookupOutcome`（私有，**不计数**：只查表 + 滑动续期，供 lookback 多次探测用）
+  - `CacheMeter::note_lookup(&self, outcome: LookupOutcome)`（按一次业务查找的最终结果记一次账）
+  - `CacheMeter::lookup_outcome(&self, hash: u64) -> LookupOutcome`（= `probe_outcome` + `note_lookup`，单次查找的公开入口）
   - `CacheMeter::lookup_and_renew(&self, hash: u64) -> Option<u32>`（签名不变，变成薄封装）
   - `CacheMeter::stats_total(&self) -> StatsSnapshot`
   - `CacheMeter::take_stats_delta(&self) -> StatsSnapshot`
@@ -691,7 +711,7 @@ git commit -m "perf(cache): replace per-insert full sort with O(n) watermark evi
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test --lib cache_metering::tests::stats_ 2>&1 | tail -20`
+Run: `cargo test --bin kiro-rs cache_metering::tests::stats_`
 Expected: 编译失败，`cannot find type 'LookupOutcome'`。
 
 - [ ] **Step 3: 实现 Stats 与 LookupOutcome**
@@ -769,8 +789,12 @@ struct Inner {
 把 `lookup_and_renew` 整个替换为：
 
 ```rust
-    /// 查询单个哈希，返回命中结果与 miss 归因。命中时按 entry 自身 TTL 滑动续期。
-    pub fn lookup_outcome(&self, hash: u64) -> LookupOutcome {
+    /// 探测单个哈希，返回命中结果与 miss 归因。命中时按 entry 自身 TTL 滑动续期。
+    ///
+    /// **不碰任何计数器**：lookback 一个断点要探测多达 20 个 hash，
+    /// 逐个记账会把「一次成功命中」记成「多条 miss + 一条 hit」。
+    /// 业务计数统一由调用方在断点结束后调一次 `note_lookup`。
+    fn probe_outcome(&self, hash: u64) -> LookupOutcome {
         let now = now_secs();
         let mut inner = self.inner.lock();
 
@@ -793,11 +817,19 @@ struct Inner {
             None => LookupOutcome::Absent,
         };
 
+        if matches!(outcome, LookupOutcome::Hit(_)) {
+            inner.dirty = true;
+        }
+
+        outcome
+    }
+
+    /// 给**一次业务查找**记一次账：命中记 1 次 `hits`，未命中按原因记 1 次
+    /// `misses` + 对应分项。一个断点无论探测过多少个 hash，只调用一次。
+    pub fn note_lookup(&self, outcome: LookupOutcome) {
+        let mut inner = self.inner.lock();
         match outcome {
-            LookupOutcome::Hit(_) => {
-                inner.dirty = true;
-                inner.stats.add(|s| &mut s.hits, 1);
-            }
+            LookupOutcome::Hit(_) => inner.stats.add(|s| &mut s.hits, 1),
             LookupOutcome::Expired => {
                 inner.stats.add(|s| &mut s.misses, 1);
                 inner.stats.add(|s| &mut s.miss_expired, 1);
@@ -811,7 +843,13 @@ struct Inner {
                 inner.stats.add(|s| &mut s.miss_no_entry, 1);
             }
         }
+    }
 
+    /// 查一个哈希并记一次账。单 hash 查找（含 `lookup_and_renew`）走这里；
+    /// 多 hash 回溯探测请用 `probe_outcome` + 末尾一次 `note_lookup`。
+    pub fn lookup_outcome(&self, hash: u64) -> LookupOutcome {
+        let outcome = self.probe_outcome(hash);
+        self.note_lookup(outcome);
         outcome
     }
 
@@ -868,12 +906,12 @@ struct Inner {
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cargo test --lib cache_metering 2>&1 | tail -20`
+Run: `cargo test --bin kiro-rs cache_metering`
 Expected: 全部 PASS（`lookup_miss_then_record_then_hit`、`ttl_expiry_makes_entry_miss` 等现有测试不受影响）。
 
 - [ ] **Step 5: 格式化与静态检查**
 
-Run: `cargo fmt && cargo clippy --all-targets -- -D warnings 2>&1 | tail -20`
+Run: `cargo fmt && cargo clippy --all-targets -- -D warnings`
 Expected: 无告警。
 
 - [ ] **Step 6: Commit**
@@ -888,7 +926,7 @@ git commit -m "feat(cache): add hit/miss stats counters and LookupOutcome attrib
 ### Task 4: 墓碑表与 evicted / expired 归因
 
 **Files:**
-- Modify: `src/anthropic/cache_metering.rs`（`Inner`、`CacheMeter`、`record_entry`、`shrink_to_watermark`、`evict_expired`、`lookup_outcome`）
+- Modify: `src/anthropic/cache_metering.rs`（`Inner`、`CacheMeter`、`record_entry`、`shrink_to_watermark`、`evict_expired`、`probe_outcome`）
 - Test: `src/anthropic/cache_metering.rs` 的 `mod tests`
 
 **Interfaces:**
@@ -992,7 +1030,7 @@ git commit -m "feat(cache): add hit/miss stats counters and LookupOutcome attrib
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test --lib cache_metering::tests::tombstones_ 2>&1 | tail -20`
+Run: `cargo test --bin kiro-rs cache_metering::tests::tombstones_`
 Expected: 编译失败，`no field 'tombstones' on type 'Inner'`。
 
 - [ ] **Step 3: 实现墓碑表**
@@ -1088,7 +1126,7 @@ fn note_tombstone(inner: &mut Inner, enabled: bool, hash: u64, kind: TombstoneKi
         }
 ```
 
-`lookup_outcome` 里 `None => LookupOutcome::Absent,` 这一支改为查墓碑：
+`probe_outcome` 里 `None => LookupOutcome::Absent,` 这一支改为查墓碑（`lookup_outcome` 是它的薄封装，归因自动跟着变）：
 
 ```rust
             None => match inner.tombstones.get(&hash) {
@@ -1100,12 +1138,12 @@ fn note_tombstone(inner: &mut Inner, enabled: bool, hash: u64, kind: TombstoneKi
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cargo test --lib cache_metering 2>&1 | tail -20`
+Run: `cargo test --bin kiro-rs cache_metering`
 Expected: 全部 PASS。
 
 - [ ] **Step 5: 格式化与静态检查**
 
-Run: `cargo fmt && cargo clippy --all-targets -- -D warnings 2>&1 | tail -20`
+Run: `cargo fmt && cargo clippy --all-targets -- -D warnings`
 Expected: 无告警。
 
 - [ ] **Step 6: Commit**
@@ -1124,11 +1162,15 @@ git commit -m "feat(cache): add capped tombstone table to distinguish evicted vs
 - Test: `src/anthropic/cache_metering.rs` 的 `mod tests`
 
 **Interfaces:**
-- Consumes: Task 3/4 的 `lookup_outcome`、`StatsSnapshot`、`stats_total`。
+- Consumes: Task 3/4 的 `probe_outcome`、`note_lookup`、`StatsSnapshot`、`stats_total`。
 - Produces:
-  - `CacheMeter::note_miss_no_breakpoint(&self)`
-  - `CacheMeter::note_miss_no_seed(&self)`
-  - `CacheMeter::note_remote_hit(&self)`
+  - `CacheMeter::note_miss_no_breakpoint(&self)`（计数 + `debug!`）
+  - `CacheMeter::note_miss_no_seed(&self)`（计数 + `debug!`）
+
+**计数口径（本任务与 Task 3 是同一个验收单元）**：lookback 用不计数的 `probe_outcome` 探测，
+一个断点探完后**只调一次** `note_lookup` —— 命中记 1 次 hit（远端命中同样走这里，不再需要
+单独的 `note_remote_hit`），全部落空记 1 次 miss 并用 `deepest_reason` 分类。这样计数器口径与
+`if !hit { debug! }` 日志口径完全一致：**每断点一条账、每断点最多一条 miss 日志**。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1192,16 +1234,119 @@ git commit -m "feat(cache): add capped tombstone table to distinguish evicted vs
         let after = cache.stats_total();
 
         assert!(warm.cache_read > 0, "应从远端命中");
-        assert!(after.hits > before.hits, "远端命中必须计入 hits");
+        assert_eq!(after.hits, before.hits + 1, "远端命中必须计 1 次 hit");
         assert_eq!(after.misses, before.misses, "远端命中不得计入 misses");
     }
+
+    /// 构造 user 消息为 text block 数组的请求。
+    /// `bp_on_first = true`：只有第 0 块、断点在第 0 块（用来预热浅层前缀）。
+    /// `bp_on_first = false`：第 0、1 两块、断点在第 1 块 —— 它的 lookback 能回溯到
+    /// 第 0 块，正是「深层不存在、浅层命中」要用的形状。两者第 0 块内容完全一致，
+    /// 所以 cum_hash[0] 相同。
+    fn build_request_with_two_blocks(bp_on_first: bool) -> MessagesRequest {
+        use super::super::types::Message;
+        let cc = serde_json::json!({"type": "ephemeral"});
+        let mut first = serde_json::json!({"type": "text", "text": "A".repeat(400)});
+        let mut second = serde_json::json!({"type": "text", "text": "B".repeat(400)});
+        if bp_on_first {
+            first["cache_control"] = cc;
+        } else {
+            second["cache_control"] = cc;
+        }
+        let content = if bp_on_first {
+            serde_json::Value::Array(vec![first])
+        } else {
+            serde_json::Value::Array(vec![first, second])
+        };
+        MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 32,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content,
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        }
+    }
+
+    /// 全部落空：一个断点探测多个 hash 也只记 **1 次** miss。
+    #[test]
+    fn lookback_all_miss_counts_one_miss_per_breakpoint() {
+        let cache = CacheMeter::new(None);
+        let req = build_request_with_two_blocks(false);
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
+        assert_eq!(usage.cache_read, 0, "冷启动不该有 read");
+
+        let stats = cache.stats_total();
+        assert_eq!(stats.misses, 1, "一个断点只记一次 miss，不是每次探测一条");
+        assert_eq!(stats.miss_no_entry, 1);
+        assert_eq!(stats.hits, 0);
+    }
+
+    /// 深层不存在、浅层命中：记 1 次 hit、0 次 miss。
+    #[test]
+    fn lookback_deep_miss_shallow_hit_counts_one_hit_only() {
+        let cache = CacheMeter::new(None);
+        // 先用「断点在第 0 块」的请求写入浅层前缀
+        let seed_req = build_request_with_two_blocks(true);
+        let _ = compute_cache_usage_sync(&cache, &seed_req, 1);
+        let before = cache.stats_total();
+
+        // 再用「断点在第 1 块」的请求：最深 hash 没写过，回溯到第 0 块命中
+        let req = build_request_with_two_blocks(false);
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
+        assert!(usage.cache_read > 0, "应回溯命中浅层前缀");
+
+        let after = cache.stats_total();
+        assert_eq!(after.hits, before.hits + 1, "一次成功命中只记 1 次 hit");
+        assert_eq!(
+            after.misses, before.misses,
+            "命中的断点不得同时记 miss —— 深层探测落空不是业务 miss"
+        );
+    }
+
+    /// 远端路径下同样成立：深层落空、浅层命中只记 1 次 hit。
+    #[tokio::test]
+    async fn lookback_deep_miss_shallow_hit_counts_one_hit_remote() {
+        let remote = Arc::new(FakeRemoteStore::default());
+        let cache = CacheMeter::with_remote(None, Some(remote.clone()));
+        let seed_req = build_request_with_two_blocks(true);
+        let _ = compute_cache_usage(&cache, &seed_req, 1).await;
+
+        // 清掉本地表，强制走远端
+        {
+            let mut inner = cache.inner.lock();
+            inner.entries.clear();
+            inner.tombstones.clear();
+        }
+        let before = cache.stats_total();
+        let req = build_request_with_two_blocks(false);
+        let usage = compute_cache_usage(&cache, &req, 1).await;
+
+        assert!(usage.cache_read > 0, "应从远端回溯命中");
+        let after = cache.stats_total();
+        assert_eq!(after.hits, before.hits + 1);
+        assert_eq!(after.misses, before.misses);
+    }
 ```
+
+> `build_request_with_two_blocks` 落地时先 `cargo test --bin kiro-rs lookback_` 跑一遍：
+> 若 `estimate_tokens` 把 400 字符估成 0 token 会让 block 不可缓存，按需要加长文本。
+> 两个请求的第 0 块内容必须逐字节相同（`without_cache_control` 会剥掉 `cache_control`
+> 再算 signature），否则 cum_hash[0] 对不上，测试会退化成「全部落空」。
 
 > 注：若 `MessagesRequest` 没有 `Default` 实现，请改为照搬 `build_request_with_system_breakpoint` 的字段逐项构造，并把 `system` 字段置为 `None`、所有 `cache_control` 置为 `None`。先 `cargo check` 确认哪种可用。
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test --lib cache_metering::tests::compute_cache_usage_counts 2>&1 | tail -20`
+Run: `cargo test --bin kiro-rs cache_metering::tests::compute_cache_usage_counts`
 Expected: 编译失败或断言失败（`miss_no_breakpoint` 为 0）。
 
 - [ ] **Step 3: 实现归因入口**
@@ -1211,23 +1356,27 @@ Expected: 编译失败或断言失败（`miss_no_breakpoint` 为 0）。
 ```rust
     /// 请求没有任何可用断点（无 cache_control / 超 MAX_BREAKPOINTS / 混合 TTL 顺序非法）。
     pub fn note_miss_no_breakpoint(&self) {
-        let mut inner = self.inner.lock();
-        inner.stats.add(|s| &mut s.misses, 1);
-        inner.stats.add(|s| &mut s.miss_no_breakpoint, 1);
+        {
+            let mut inner = self.inner.lock();
+            inner.stats.add(|s| &mut s.misses, 1);
+            inner.stats.add(|s| &mut s.miss_no_breakpoint, 1);
+        }
+        tracing::debug!("cache_meter miss reason=no_breakpoint");
     }
 
     /// 请求拿不到会话隔离种子（无 metadata.user_id 且 key_id == 0）。
     pub fn note_miss_no_seed(&self) {
-        let mut inner = self.inner.lock();
-        inner.stats.add(|s| &mut s.misses, 1);
-        inner.stats.add(|s| &mut s.miss_no_seed, 1);
-    }
-
-    /// 远端共享后端命中（绕开本地 lookup，需要单独计入 hits）。
-    pub fn note_remote_hit(&self) {
-        self.inner.lock().stats.add(|s| &mut s.hits, 1);
+        {
+            let mut inner = self.inner.lock();
+            inner.stats.add(|s| &mut s.misses, 1);
+            inner.stats.add(|s| &mut s.miss_no_seed, 1);
+        }
+        tracing::debug!("cache_meter miss reason=no_seed");
     }
 ```
+
+> 两处 `debug!` 写在锁作用域之外：`tracing` 的 subscriber 是用户代码，不在持锁期间调用。
+> 加上 lookback 的 `reason=Absent/Expired/Evicted` 三类，`RUST_LOG=debug` 下五种 miss 原因都有日志。
 
 `compute_cache_usage`（async）里两处早退加计数：
 
@@ -1262,7 +1411,9 @@ lookback 循环整体替换为：
         let start_idx = lookback_start_index(&blocks, bp.block_idx);
         // 归因取最深那个 hash（第一次探测）的判定结果 —— 它才是本可命中的那一条
         let mut deepest_reason = LookupOutcome::Absent;
-        let mut hit = false;
+        // 一个断点只记一次账：探测期间一律用不计数的 probe_outcome，
+        // 循环结束后按最终结果调一次 note_lookup。
+        let mut hit_tokens_final: Option<u32> = None;
 
         for check_idx in (start_idx..=bp.block_idx).rev() {
             let hash = cum_hashes[check_idx];
@@ -1273,14 +1424,13 @@ lookback 循环整体替换为：
                 if let Some(tokens) = remote.lookup_and_renew(hash).await {
                     // 回填本地保持同步
                     cache.record_entry(hash, tokens, bp.ttl_secs);
-                    cache.note_remote_hit();
                     hit_tokens = Some(tokens);
                 }
             }
 
             // 若远端未配置或 miss / 出错降级，查本地
             if hit_tokens.is_none() {
-                let outcome = cache.lookup_outcome(hash);
+                let outcome = cache.probe_outcome(hash);
                 if check_idx == bp.block_idx {
                     deepest_reason = outcome;
                 }
@@ -1294,32 +1444,42 @@ lookback 循环整体替换为：
                     max_read_tokens = tokens;
                 }
                 // 当前断点已找到最深命中，不必继续向更浅的 block 回溯
-                hit = true;
+                hit_tokens_final = Some(tokens);
                 break;
             }
         }
 
-        if !hit {
-            tracing::debug!(
-                "cache_meter miss block_idx={} reason={:?} ttl={}",
-                bp.block_idx,
-                deepest_reason,
-                bp.ttl_secs
-            );
+        match hit_tokens_final {
+            // 本地或远端命中都走这里：一个断点记 1 次 hit
+            Some(tokens) => cache.note_lookup(LookupOutcome::Hit(tokens)),
+            None => {
+                // 全部落空：记 1 次 miss，原因取最深那次探测的判定
+                cache.note_lookup(deepest_reason);
+                tracing::debug!(
+                    "cache_meter miss block_idx={} reason={:?} ttl={}",
+                    bp.block_idx,
+                    deepest_reason,
+                    bp.ttl_secs
+                );
+            }
         }
     }
 ```
 
-`compute_cache_usage_sync` 做同样的三处改动（两个早退加 `note_miss_no_breakpoint()` / `note_miss_no_seed()`，lookback 循环用 `lookup_outcome` + `deepest_reason` + `debug!`；该函数没有远端路径，去掉 `note_remote_hit` 那段）。
+> `deepest_reason` 的初值是 `Absent`，而全部落空时最深那次探测一定执行过
+> （`check_idx` 从 `bp.block_idx` 开始），所以 `note_lookup(deepest_reason)` 不会是
+> `Hit` 分支 —— 远端命中会在上面 `break` 掉。
+
+`compute_cache_usage_sync` 做同样的三处改动（两个早退加 `note_miss_no_breakpoint()` / `note_miss_no_seed()`，lookback 循环用 `probe_outcome` 探测、循环后一次 `note_lookup` + `debug!`；该函数没有远端路径，去掉 `remote` 那段）。两个函数的计数口径必须完全一致，否则同步/异步两条路径的报表对不上。
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cargo test --lib cache_metering 2>&1 | tail -20`
+Run: `cargo test --bin kiro-rs cache_metering`
 Expected: 全部 PASS（`compute_cache_usage_first_miss_then_hit`、`no_cache_control_does_not_cache_at_all`、`max_breakpoints_limit_enforced` 等现有测试断言不变）。
 
 - [ ] **Step 5: 格式化与静态检查**
 
-Run: `cargo fmt && cargo clippy --all-targets -- -D warnings 2>&1 | tail -20`
+Run: `cargo fmt && cargo clippy --all-targets -- -D warnings`
 Expected: 无告警。
 
 - [ ] **Step 6: Commit**
@@ -1335,16 +1495,22 @@ git commit -m "feat(cache): attribute misses per breakpoint with debug logging"
 
 **Files:**
 - Modify: `src/anthropic/cache_metering.rs:591-631`（`flush_to_disk` / `spawn_background`）、`CacheMeter` 结构
+- Modify: `Cargo.toml`（新增 `[dev-dependencies]`，给测试打开 tokio 的 `test-util`，用于时间调度测试）
 - Test: `src/anthropic/cache_metering.rs` 的 `mod tests`
 
 **Interfaces:**
 - Consumes: Task 1 的 `DEFAULT_FLUSH_INTERVAL_SECS` / 钳制常量，Task 2 的 `sweep`，Task 3 的 `take_stats_delta`。
 - Produces:
+  - 常量 `SWEEP_INTERVAL_SECS: u64 = 60`
   - 字段 `CacheMeter::flush_interval_secs: u64`
   - `CacheMeter::with_flush_interval_secs(self, secs: u64) -> Self`
   - `CacheMeter::flush_interval_secs(&self) -> u64`
   - `CacheMeter::persist_enabled(&self) -> bool`（即 `persist_path.is_some()`）
   - `CacheMeter::log_stats_delta(&self)`
+
+**落盘必须用独立定时器**：巡检固定 60 秒一轮，落盘按 `flush_interval_secs` 自己计时，
+两者在 `tokio::select!` 里并行。若把落盘挂在 60 秒巡检里判断「距上次落盘是否够久」，
+配 10 秒实际最快 60 秒才落一次、配 90 秒实际 120 秒，和对外声明的 `[10, 3600]` 可配置区间不符。
 
 落盘关闭 = `main.rs` 传 `persist_path = None`（Task 8 接线）。本任务只保证 `None` 时既不读也不写。
 
@@ -1424,14 +1590,90 @@ git commit -m "feat(cache): attribute misses per breakpoint with debug logging"
         );
         assert_eq!(cache.stats_total().misses, 1, "累计量保留");
     }
+
+    /// 落盘定时器必须独立于 60 秒巡检：配 10 秒就要在 10 秒量级落盘，
+    /// 配 90 秒就要在 90 秒落盘（而不是被巡检对齐到 60/120 秒）。
+    /// 用 tokio 的虚拟时钟，不真的等。
+    async fn flush_count_within(interval_secs: u64, advance_secs: u64, persist: bool) -> usize {
+        let tmp = std::env::temp_dir().join(format!(
+            "kiro-pc-sched-{}-{}-{}.json",
+            interval_secs,
+            advance_secs,
+            fastrand::u64(..)
+        ));
+        let path = if persist { Some(tmp.clone()) } else { None };
+        let cache = Arc::new(
+            CacheMeter::new(path)
+                .with_flush_interval_secs(interval_secs),
+        );
+        cache.record_entry(1, 10, 3_600);
+        cache.clone().spawn_background();
+
+        let mut writes = 0usize;
+        let mut last: Option<std::time::SystemTime> = None;
+        for _ in 0..advance_secs {
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            // 让后台任务有机会被调度
+            tokio::task::yield_now().await;
+            if let Ok(meta) = std::fs::metadata(&tmp) {
+                let mtime = meta.modified().ok();
+                if mtime != last {
+                    writes += 1;
+                    last = mtime;
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&tmp);
+        writes
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_timer_is_independent_of_sweep_period() {
+        // 10 秒间隔：在 50 秒内（第一次巡检都还没到）必须已经落过盘
+        assert!(
+            flush_count_within(10, 50, true).await >= 1,
+            "flush_interval=10 不应被 60 秒巡检拖到 60 秒后才落盘"
+        );
+        // 90 秒间隔：100 秒内应恰好落过一次（而不是被对齐到 120 秒）
+        assert!(
+            flush_count_within(90, 100, true).await >= 1,
+            "flush_interval=90 应在 90 秒落盘，而不是 120 秒"
+        );
+        // 300 秒（默认）：200 秒内不该落盘
+        assert_eq!(
+            flush_count_within(300, 200, true).await,
+            0,
+            "flush_interval=300 在 200 秒内不该落盘"
+        );
+        // 关闭持久化：无论多久都不落盘
+        assert_eq!(
+            flush_count_within(10, 200, false).await,
+            0,
+            "persist 关闭时落盘分支必须完全不执行"
+        );
+    }
 ```
+
+> 这组测试用的是 tokio 的虚拟时钟（`start_paused`），需要 `test-util` feature；
+> 若 `tokio::time::advance` 下 `flush_to_disk` 的文件 mtime 分辨率不足以区分两次写入，
+> 改为统计落盘次数的测试钩子（`AtomicUsize` 计数器）而不是比对 mtime —— 口径不变：
+> **10 秒的配置不得被 60 秒巡检对齐**。
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test --lib cache_metering::tests::persist_disabled 2>&1 | tail -20`
+Run: `cargo test --bin kiro-rs cache_metering::tests::persist_disabled`
 Expected: 编译失败，`no method named 'persist_enabled'`。
 
 - [ ] **Step 3: 实现**
+
+`Cargo.toml` 末尾加（只影响 `cargo test` 的构建，不进发布二进制）：
+
+```toml
+[dev-dependencies]
+# 时间调度测试用虚拟时钟（#[tokio::test(start_paused = true)]）；
+# test-util 不在 tokio 的 "full" 里，必须显式打开。
+tokio = { version = "1.0", features = ["full", "test-util"] }
+```
 
 `CacheMeter` 加字段 `flush_interval_secs: u64`，`with_remote` 构造尾部补 `flush_interval_secs: DEFAULT_FLUSH_INTERVAL_SECS,`。
 
@@ -1489,45 +1731,68 @@ Expected: 编译失败，`no method named 'persist_enabled'`。
 ```rust
     /// 启动后台周期任务。
     ///
-    /// 固定 **60 秒一轮**做「清过期 + 水位检查 + 指标输出」；落盘按
-    /// `flush_interval_secs` 独立计时，这样过期清理与指标输出的及时性
-    /// 不被落盘降频拖累。
+    /// **两个互相独立的定时器**：
+    /// - 巡检 `SWEEP_INTERVAL_SECS`（60 秒）一轮，做「清过期 + 水位检查 + 指标输出」；
+    /// - 落盘按 `flush_interval_secs`（10–3600 秒）自己计时。
+    ///
+    /// 不把落盘挂在巡检轮里判断「距上次够久没有」：那样 10 秒的配置实际最快 60 秒
+    /// 才落一次、90 秒的配置实际 120 秒，与对外声明的可配置区间不符。
+    /// 落盘关闭时该分支用 `select!` 的条件直接禁用，定时器不参与竞争。
     pub fn spawn_background(self: Arc<Self>) {
-        let flush_interval = std::time::Duration::from_secs(self.flush_interval_secs);
+        let sweep_period = std::time::Duration::from_secs(SWEEP_INTERVAL_SECS);
+        let flush_period = std::time::Duration::from_secs(self.flush_interval_secs);
+        let persist = self.persist_enabled();
         let weak = Arc::downgrade(&self);
+        drop(self);
         tokio::spawn(async move {
-            let tick = std::time::Duration::from_secs(60);
-            let mut last_flush = tokio::time::Instant::now();
+            let mut sweep_tick = tokio::time::interval(sweep_period);
+            let mut flush_tick = tokio::time::interval(flush_period);
+            // interval 的第一次 tick 立刻返回，先吃掉，避免启动瞬间就落一次盘
+            sweep_tick.tick().await;
+            flush_tick.tick().await;
+            // 落后时补齐而不是追打一串 tick（进程被挂起/机器休眠后尤其重要）
+            sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                tokio::time::sleep(tick).await;
-                let Some(cache) = weak.upgrade() else { return };
-                cache.sweep();
-                cache.log_stats_delta();
-                if cache.persist_enabled() && last_flush.elapsed() >= flush_interval {
-                    cache.flush_to_disk();
-                    last_flush = tokio::time::Instant::now();
+                tokio::select! {
+                    _ = sweep_tick.tick() => {
+                        let Some(cache) = weak.upgrade() else { return };
+                        cache.sweep();
+                        cache.log_stats_delta();
+                    }
+                    _ = flush_tick.tick(), if persist => {
+                        let Some(cache) = weak.upgrade() else { return };
+                        cache.flush_to_disk();
+                    }
                 }
             }
         });
     }
 ```
 
+常量区加：
+
+```rust
+/// 后台巡检周期（秒）：清过期 + 水位检查 + 指标输出。与落盘间隔无关。
+const SWEEP_INTERVAL_SECS: u64 = 60;
+```
+
 `flush_to_disk` 不改（`persist_path == None` 时第一行就 `return`，快照仍只序列化 `inner.entries`）。
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cargo test --lib cache_metering 2>&1 | tail -20`
+Run: `cargo test --bin kiro-rs cache_metering`
 Expected: 全部 PASS（`flush_and_reload_round_trip` 作为回归保持通过）。
 
 - [ ] **Step 5: 格式化与静态检查**
 
-Run: `cargo fmt && cargo clippy --all-targets -- -D warnings 2>&1 | tail -20`
+Run: `cargo fmt && cargo clippy --all-targets -- -D warnings`
 Expected: 无告警。
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/anthropic/cache_metering.rs
+git add Cargo.toml src/anthropic/cache_metering.rs
 git commit -m "feat(cache): make snapshot persistence optional and decouple flush from sweep"
 ```
 
@@ -1552,33 +1817,63 @@ git commit -m "feat(cache): make snapshot persistence optional and decouple flus
 
 在 `src/admin/service.rs` 末尾（若已有 `mod tests` 就加进去）：
 
+测试必须**真的调用 `AdminService::get_cache_metering_config`**，不能手工 new 一个响应结构体
+再断言 serde —— 那样句柄优先、配置回落、`stats=null` 这三条本任务的核心行为一条都没被验证。
+同文件已有的 `#[tokio::test]` 已经演示了怎么构造真 service（`MultiTokenManager::new(Config::default(), ...)`
++ `AdminService::new(manager, Vec::new())`），照抄即可。
+
 ```rust
 #[cfg(test)]
 mod cache_metering_config_tests {
+    use super::*;
     use crate::anthropic::cache_metering::CacheMeter;
 
-    /// Review Focus 4：句柄缺失时 stats 为 null、配置回落，不得 panic。
-    #[test]
-    fn response_serializes_stats_as_null_without_handle() {
-        let resp = super::CacheMeteringConfigResponse {
-            enabled: true,
-            capacity: CacheMeter::resolve_capacity(None, None),
-            persist_enabled: false,
-            flush_interval_secs: CacheMeter::resolve_flush_interval_secs(None, None),
-            miss_diagnostics: true,
-            stats: None,
-        };
+    fn service_with(config: Config) -> AdminService {
+        let manager = Arc::new(MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap());
+        AdminService::new(manager, Vec::new())
+    }
+
+    /// Review Focus 4：句柄缺失时 stats 为 null、配置回落到 config/env/默认，不得 panic。
+    #[tokio::test]
+    async fn config_falls_back_without_cache_meter_handle() {
+        let service = service_with(Config::default());
+        let resp = service.get_cache_metering_config();
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["capacity"], 262_144);
+
+        assert_eq!(json["capacity"], 262_144, "回落到内置默认容量");
         assert_eq!(json["persistEnabled"], false);
         assert_eq!(json["flushIntervalSecs"], 300);
         assert_eq!(json["missDiagnostics"], true);
         assert!(json["stats"].is_null(), "句柄缺失时 stats 必须是 null");
     }
 
-    #[test]
-    fn response_reports_live_handle_values() {
-        let meter = std::sync::Arc::new(
+    /// config.json 显式值在句柄缺失时也要生效（而不是永远吐默认值）。
+    #[tokio::test]
+    async fn config_explicit_values_win_without_handle() {
+        let mut config = Config::default();
+        config.cache_metering_capacity = Some(4_096);
+        config.cache_metering_persist_enabled = Some(true);
+        config.cache_metering_flush_interval_secs = Some(600);
+        config.cache_metering_miss_diagnostics = Some(false);
+
+        let json = serde_json::to_value(service_with(config).get_cache_metering_config()).unwrap();
+        assert_eq!(json["capacity"], 4_096);
+        assert_eq!(json["persistEnabled"], true);
+        assert_eq!(json["flushIntervalSecs"], 600);
+        assert_eq!(json["missDiagnostics"], false);
+        assert!(json["stats"].is_null());
+    }
+
+    /// 有句柄时一律以运行时真实值为准，config.json 里写什么都不算数。
+    #[tokio::test]
+    async fn runtime_handle_overrides_config_values() {
+        let mut config = Config::default();
+        // 故意和句柄对着写，验证优先级
+        config.cache_metering_capacity = Some(262_144);
+        config.cache_metering_flush_interval_secs = Some(300);
+        config.cache_metering_miss_diagnostics = Some(true);
+
+        let meter = Arc::new(
             CacheMeter::new(None)
                 .with_capacity(4_096)
                 .with_miss_diagnostics(false)
@@ -1588,43 +1883,57 @@ mod cache_metering_config_tests {
         assert_eq!(meter.lookup_and_renew(1), Some(10));
         assert_eq!(meter.lookup_and_renew(2), None);
 
-        let stats = meter.stats_total();
-        let resp = super::CacheMeteringConfigResponse {
-            enabled: meter.is_enabled(),
-            capacity: meter.capacity(),
-            persist_enabled: meter.persist_enabled(),
-            flush_interval_secs: meter.flush_interval_secs(),
-            miss_diagnostics: meter.miss_diagnostics(),
-            stats: Some(super::CacheMeteringStatsResponse {
-                entries_len: meter.len(),
-                hits: stats.hits,
-                misses: stats.misses,
-                miss_no_entry: stats.miss_no_entry,
-                miss_expired: stats.miss_expired,
-                miss_evicted: stats.miss_evicted,
-                miss_no_breakpoint: stats.miss_no_breakpoint,
-                miss_no_seed: stats.miss_no_seed,
-                evicted_total: stats.evicted_total,
-                expired_total: stats.expired_total,
-                tombstone_clears: stats.tombstone_clears,
-            }),
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["capacity"], 4_096);
-        assert_eq!(json["missDiagnostics"], false);
+        let service = service_with(config).with_cache_meter(meter);
+        let json = serde_json::to_value(service.get_cache_metering_config()).unwrap();
+
+        assert_eq!(json["capacity"], 4_096, "以句柄为准");
         assert_eq!(json["flushIntervalSecs"], 600);
+        assert_eq!(json["missDiagnostics"], false);
+        assert_eq!(json["persistEnabled"], false);
         assert_eq!(json["stats"]["entriesLen"], 1);
         assert_eq!(json["stats"]["hits"], 1);
         assert_eq!(json["stats"]["missNoEntry"], 1);
     }
+
+    /// PUT 只改 `enabled`，其余只读字段必须原样保留（回归：别被顺手覆写成默认值）。
+    #[tokio::test]
+    async fn put_only_toggles_enabled() {
+        let meter = Arc::new(
+            CacheMeter::new(None)
+                .with_capacity(4_096)
+                .with_flush_interval_secs(600)
+                .with_miss_diagnostics(false),
+        );
+        let service = service_with(Config::default()).with_cache_meter(meter);
+
+        let before = serde_json::to_value(service.get_cache_metering_config()).unwrap();
+        let resp = service
+            .set_cache_metering_config(SetCacheMeteringConfigRequest {
+                enabled: Some(false),
+            })
+            .expect("PUT 应成功");
+        let after = serde_json::to_value(&resp).unwrap();
+
+        assert_eq!(after["enabled"], false, "enabled 必须被改掉");
+        for key in ["capacity", "flushIntervalSecs", "missDiagnostics", "persistEnabled"] {
+            assert_eq!(after[key], before[key], "{key} 是只读字段，PUT 不得改动");
+        }
+    }
 }
 ```
+
+> 落地时先 `cargo check --tests` 对一下三处签名：`MultiTokenManager::new` 的参数、
+> `with_cache_meter` 接受的是 `SharedCacheMeter`（`Arc<CacheMeter>` 的别名）、
+> `set_cache_metering_config` 是同步方法且参数是 `Option<bool>`，以及它调
+> `update_config_file` 在没有配置文件时的返回值。若它在无配置文件时返回 Err，就把
+> `put_only_toggles_enabled` 改成直接断言该 Err 不影响只读字段，或给 service 一个临时
+> 配置文件路径 —— **不要**把这条测试退化成手工构造响应结构体。
 
 `src/admin/service.rs` 顶部的 `use crate::admin::types::{...}` 需加 `CacheMeteringStatsResponse`。
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test --lib admin::service::cache_metering_config_tests 2>&1 | tail -20`
+Run: `cargo test --bin kiro-rs admin::service::cache_metering_config_tests`
 Expected: 编译失败，`struct CacheMeteringConfigResponse has no field named 'capacity'`。
 
 - [ ] **Step 3: 扩展响应类型**
@@ -1739,12 +2048,12 @@ pub struct CacheMeteringConfigResponse {
 
 - [ ] **Step 5: 跑测试确认通过**
 
-Run: `cargo test --lib admin 2>&1 | tail -20`
+Run: `cargo test --bin kiro-rs admin`
 Expected: 全部 PASS。
 
 - [ ] **Step 6: 格式化与静态检查**
 
-Run: `cargo fmt && cargo clippy --all-targets -- -D warnings 2>&1 | tail -20`
+Run: `cargo fmt && cargo clippy --all-targets -- -D warnings`
 Expected: 无告警。
 
 - [ ] **Step 7: Commit**
@@ -1835,17 +2144,17 @@ git commit -m "feat(admin): expose cache metering capacity and runtime stats"
 
 - [ ] **Step 2: 编译确认**
 
-Run: `cargo build 2>&1 | tail -20`
+Run: `cargo build`
 Expected: 编译通过，无 warning。
 
 - [ ] **Step 3: 全量回归**
 
-Run: `cargo test 2>&1 | tail -30`
+Run: `cargo test`
 Expected: 全部 PASS。
 
 - [ ] **Step 4: 格式化与静态检查**
 
-Run: `cargo fmt && cargo clippy --all-targets -- -D warnings 2>&1 | tail -20`
+Run: `cargo fmt && cargo clippy --all-targets -- -D warnings`
 Expected: 无告警。
 
 - [ ] **Step 5: Commit**
@@ -1932,8 +2241,14 @@ cache_meter stats entries_len=13421 capacity=262144 hits=90120 misses=10233 evic
 - `miss_no_breakpoint` / `miss_no_seed` 占多数 → 客户端没声明 `cache_control`，
   或请求缺少 `metadata.user_id` 且用的是 `id=0` 系统 Key，与容量无关。
 
-单条 miss 的归因还会在 `RUST_LOG=debug` 下按断点逐条输出
-（`cache_meter miss block_idx=.. reason=..`，单请求最多 4 条）。
+单条 miss 的归因还会在 `RUST_LOG=debug` 下输出：有断点的请求按断点逐条打
+`cache_meter miss block_idx=.. reason=Absent|Expired|Evicted`（一个断点最多一条，
+单请求最多 4 条）；整条请求级的两种原因打 `cache_meter miss reason=no_breakpoint`
+与 `cache_meter miss reason=no_seed`。五种原因都可在 debug 日志里看到。
+
+> 计数口径：**一个断点只记一次账**。lookback 会向后探最多 20 个 hash，
+> 「深层没有、浅层命中」是正常的部分前缀命中，只记 1 次 `hits`，不会同时产生
+> 一堆 `misses` —— 否则命中率报表会被探测次数稀释。
 
 #### 升级提示：快照默认不再落盘
 
@@ -1968,7 +2283,7 @@ Expected: 打印 `OK`。
 
 - [ ] **Step 5: 全量回归**
 
-Run: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test 2>&1 | tail -30`
+Run: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 Expected: 三项全通过。
 
 - [ ] **Step 6: Commit**
