@@ -874,8 +874,13 @@ impl CacheMeter {
         );
         inner.tombstones.remove(&hash);
         inner.dirty = true;
+        // 「先过期、后容量」：过期条目必须记成 Expired/expired_total，
+        // 否则会被当成容量淘汰，污染 miss_evicted 这个容量诊断信号。
         if inner.entries.len() > hard_limit(self.capacity) {
-            self.shrink_to_watermark(&mut inner);
+            self.evict_expired_locked(&mut inner, now);
+            if inner.entries.len() > hard_limit(self.capacity) {
+                self.shrink_to_watermark(&mut inner);
+            }
         }
     }
 
@@ -911,8 +916,9 @@ impl CacheMeter {
     /// 后台巡检一轮：先清过期，再在超过 `capacity` 时清到水位。
     /// `record_entry` 的 `1.2C` 兜底只在突发写入快过本回收时才会触发。
     pub fn sweep(&self) {
-        self.evict_expired();
+        let now = now_secs();
         let mut inner = self.inner.lock();
+        self.evict_expired_locked(&mut inner, now);
         if inner.entries.len() > self.capacity {
             self.shrink_to_watermark(&mut inner);
         }
@@ -987,11 +993,21 @@ impl CacheMeter {
         });
     }
 
-    /// 删除已过期条目（lookup 不命中过期时只是返回 miss，不会顺手清理；
-    /// 这里在后台周期里清一次，避免内存膨胀）。
+    /// 删除已过期条目（lookup 不命中过期时只是返回 miss，不会顺手清理）。
+    ///
+    /// 生产路径统一走 `sweep()` 与 `record_entry` 的强制回收，两者都直接调
+    /// `evict_expired_locked`；这里只保留给测试单独验证过期清理用。
+    #[cfg(test)]
     pub fn evict_expired(&self) {
         let now = now_secs();
         let mut inner = self.inner.lock();
+        self.evict_expired_locked(&mut inner, now);
+    }
+
+    /// `evict_expired` 的持锁版本：后台巡检和 `record_entry` 的强制回收共用，
+    /// 保证两条路径的归因顺序一致（先 Expired，后 Evicted），也避免在已持锁时
+    /// 再去调用会重新加锁的 `evict_expired()`。
+    fn evict_expired_locked(&self, inner: &mut Inner, now: i64) {
         let dead: Vec<u64> = inner
             .entries
             .iter()
@@ -1004,7 +1020,7 @@ impl CacheMeter {
         let diagnostics = self.miss_diagnostics;
         for k in &dead {
             inner.entries.remove(k);
-            note_tombstone(&mut inner, diagnostics, *k, TombstoneKind::Expired);
+            note_tombstone(inner, diagnostics, *k, TombstoneKind::Expired);
         }
         inner.stats.add(|s| &mut s.expired_total, dead.len() as u64);
         inner.dirty = true;
@@ -4016,6 +4032,72 @@ mod tests {
         cache.evict_expired();
         assert_eq!(cache.lookup_outcome(5), LookupOutcome::Expired);
         assert_eq!(cache.stats_total().miss_expired, 1);
+    }
+
+    /// 强制回收必须「先过期、后容量」：过期条目不能被记成容量淘汰，
+    /// 否则 README 的容量诊断会被 `miss_evicted` 误导。
+    #[test]
+    fn forced_reclaim_expires_before_evicting() {
+        let cache = meter_with_capacity(2_000);
+        for i in 0..2_400u64 {
+            cache.record_entry(i, 1, 300);
+        }
+        // 把其中 800 条标成已过期
+        {
+            let mut inner = cache.inner.lock();
+            let past = now_secs() - 1;
+            for k in 0..800u64 {
+                inner.entries.get_mut(&k).unwrap().expires_at = past;
+            }
+        }
+        // 第 2401 条越过 1.2C(=2400) 硬顶
+        cache.record_entry(9_999, 1, 300);
+
+        assert_eq!(
+            cache.len(),
+            1_601,
+            "清掉 800 条过期后 1601 条已低于硬顶，不该再做容量淘汰"
+        );
+        let stats = cache.stats_total();
+        assert_eq!(stats.expired_total, 800, "过期条目应记为 expired_total");
+        assert_eq!(stats.evicted_total, 0, "没有条目因容量被淘汰");
+        assert_eq!(
+            cache.lookup_outcome(0),
+            LookupOutcome::Expired,
+            "过期条目应留下 Expired 墓碑而非 Evicted"
+        );
+        assert!(
+            cache.inner.lock().entries.contains_key(&9_999),
+            "刚写入的条目必须还在"
+        );
+    }
+
+    /// 清完过期后仍超硬顶时，剩下的缺口才按容量淘汰。
+    #[test]
+    fn forced_reclaim_still_evicts_when_expiry_is_not_enough() {
+        let cache = meter_with_capacity(2_000);
+        for i in 0..2_400u64 {
+            cache.record_entry(i, 1, 300);
+        }
+        {
+            let mut inner = cache.inner.lock();
+            let past = now_secs() - 1;
+            for k in 0..100u64 {
+                inner.entries.get_mut(&k).unwrap().expires_at = past;
+            }
+        }
+        cache.record_entry(9_999, 1, 300);
+
+        // 2401 - 100 = 2301 已低于硬顶，这一轮不做容量淘汰
+        assert_eq!(cache.len(), 2_301);
+        // 再写到 2401 条，此时无过期可清，只能走容量淘汰
+        for i in 10_000..10_100u64 {
+            cache.record_entry(i, 1, 300);
+        }
+        assert_eq!(cache.len(), 1_800, "无过期可清时应清到 0.9C");
+        let stats = cache.stats_total();
+        assert_eq!(stats.expired_total, 100);
+        assert_eq!(stats.evicted_total, 601, "2401 - 1800 = 601 条容量淘汰");
     }
 
     #[test]
