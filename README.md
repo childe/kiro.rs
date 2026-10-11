@@ -375,6 +375,10 @@ Admin API 鉴权同样支持：
 | `selfHealMaxConsecutiveRounds` | `5` | 连续自愈且无成功的最大轮数（`0`=不限），超限即停并提示人工介入 |
 | `modelCacheTtlSecs` | `3600` | 每个凭据的上游可用模型缓存 TTL（秒） |
 | `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |
+| `cacheMeteringCapacity` | `262144` | prompt cache 计量条目上限，钳到 `[1024, 8388608]`；见下方「计量容量选型」 |
+| `cacheMeteringPersistEnabled` | `false` | 是否把计量快照落到 `cache_metering.json`（**0.9.x 起默认关闭**） |
+| `cacheMeteringFlushIntervalSecs` | `300` | 快照落盘间隔（秒），钳到 `[10, 3600]`，仅在落盘开启时有意义 |
+| `cacheMeteringMissDiagnostics` | `true` | 是否开启 miss 归因墓碑表（约 3MB 封顶），关闭后 `missEvicted` 退化为 `missNoEntry` |
 | `traceEnabled` | `true` | 是否写入 `traces.db` |
 | `traceRetentionDays` | `7` | trace 保留天数 |
 | `usageLogRetentionDays` | `31` | `usage_log.*.jsonl` 保留天数 |
@@ -700,7 +704,7 @@ data/
 - `kiro_stats.json`：凭据成功 / 失败 / 额度 / 冷却等统计。
 - `kiro_balance_cache.json`：凭据订阅、额度、邮箱等缓存。
 - `proxy_pool.json`：代理池与健康状态。
-- `cache_metering.json`：prompt cache 计量缓存，定期落盘。
+- `cache_metering.json`：prompt cache 计量快照，**默认不再读写**（需显式 `cacheMeteringPersistEnabled: true`）。
 - `traces.db`：SQLite 请求链路追踪数据库，WAL 模式。
 - `usage_log.*.jsonl`：按日滚动请求用量日志。
 
@@ -710,6 +714,78 @@ data/
 - `cache_creation_input_tokens`
 - `cache_read_input_tokens`
 - `output_tokens`
+
+### Prompt cache 计量容量选型
+
+`CacheMeter` 是一张定容表。写入速率为 `W` 条/秒时，一条 entry 的实际存活期是
+
+```text
+T_eff = min(C / W, TTL)
+```
+
+`C < W × TTL` 时 TTL 完全失效，命中率由容量而不是 TTL 决定，表现为 `cache_read`
+随负载**无声衰减**。上游每请求最多写 4 条断点、默认 TTL 300 秒，所以容量应满足：
+
+```text
+C >= peak_req_per_sec × entries_per_req × TTL_secs
+```
+
+默认 `262144` 支撑约 `262144 / (4 × 300) ≈ 218 req/s`，内存约 16–24MB
+（单条按 64 字节估算）。上界 `8388608` 约 512MB —— 那是「再大就该上 Redis
+共享层而不是堆内存」的界线，不是推荐值。改过切段策略、`entries_per_req`
+远大于 4 的部署，按公式自行调高。
+
+容量、落盘开关、落盘间隔、miss 诊断开关**启动时固定，运行时不可改**：
+改容量会立即触发一次大规模淘汰，不适合做热调旋钮。改这些 = 改 `config.json`
+（或环境变量）+ 重启。Admin API `GET /api/admin/cache-metering` 只读暴露当前生效值。
+
+环境变量（优先级：`config.json` 显式值 > 环境变量 > 内置默认）：
+
+| 环境变量 | 对应字段 | 默认 |
+|---|---|---:|
+| `KIRO_RS_CACHE_CAPACITY` | `cacheMeteringCapacity` | `262144` |
+| `KIRO_RS_CACHE_PERSIST` | `cacheMeteringPersistEnabled` | `false` |
+| `KIRO_RS_CACHE_FLUSH_INTERVAL_SECS` | `cacheMeteringFlushIntervalSecs` | `300` |
+| `KIRO_RS_CACHE_MISS_DIAGNOSTICS` | `cacheMeteringMissDiagnostics` | `true` |
+
+数值解析失败、为 `0` 或为空串都视为「未表态」并打一条 warn，回落到下一优先级，不会中止启动。
+
+#### 怎么判断该不该调容量
+
+后台任务每 60 秒输出一行（本周期无任何增量时不输出）：
+
+```text
+cache_meter stats entries_len=13421 capacity=262144 hits=90120 misses=10233 evicted=0 expired=240311
+  miss_no_entry=8120 miss_expired=1900 miss_evicted=13 miss_no_breakpoint=180 miss_no_seed=20 tombstone_clears=0
+```
+
+- `miss_evicted` 持续非零 + `entries_len` 贴着 `capacity` → **容量不够**，按上面的公式调高。
+- `miss_expired` 占多数、`evicted=0` → 是真实 TTL 过期，调容量没用。
+- `miss_no_breakpoint` / `miss_no_seed` 占多数 → 客户端没声明 `cache_control`，
+  或请求缺少 `metadata.user_id` 且用的是 `id=0` 系统 Key，与容量无关。
+
+单条 miss 的归因还会在 `RUST_LOG=debug` 下输出：有断点的请求按断点逐条打
+`cache_meter miss block_idx=.. reason=Absent|Expired|Evicted`（一个断点最多一条，
+单请求最多 4 条）；整条请求级的两种原因打 `cache_meter miss reason=no_breakpoint`
+与 `cache_meter miss reason=no_seed`。五种原因都可在 debug 日志里看到。
+
+> 计数口径：**一个断点只记一次账**。lookback 会向后探最多 20 个 hash，
+> 「深层没有、浅层命中」是正常的部分前缀命中，只记 1 次 `hits`，不会同时产生
+> 一堆 `misses` —— 否则命中率报表会被探测次数稀释。
+
+#### 升级提示：快照默认不再落盘
+
+`cacheMeteringPersistEnabled` 默认为 `false`，即**默认不再读写 `cache_metering.json`**。
+依据：计量 TTL 只有 300 秒，快照只在重启后 5 分钟内有价值，而容量调大后单次全量
+JSON 重写的代价线性放大。关闭时启动不读该文件、运行与退出都不写该文件，
+也**不会删除**已有文件（留给回滚）。需要原行为显式写：
+
+```json
+{ "cacheMeteringPersistEnabled": true }
+```
+
+快照格式仍是 JSON（未换二进制）：默认关闭后这条路径不再是热点，换格式要带
+迁移与兼容分支，收益不抵复杂度。旧版本写的快照文件可直接被新版本加载。
 
 <a id="admin-ui"></a>
 ## 🖥️ Admin UI
