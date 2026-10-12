@@ -37,22 +37,20 @@ use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
-    AddCredentialResponse, AssignProxyRequest,
-    AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
-    BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialMetadataDetail,
-    CredentialStatusItem,
-    CredentialsExportResponse, CredentialsStatusResponse, CustomModelsConfigResponse, CustomModelItem,
-    EnableOverageAllResult, ExportedAccount,
-    ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
-    ModelApiRetryConfigResponse,
-    CredentialMetadataSchemaConfig,
-    CacheMeteringConfigResponse, SetCacheMeteringConfigRequest,
-    SessionAffinityConfigResponse, SetSessionAffinityConfigRequest,
-    LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
-    PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
-    ProxyPoolResponse, QuotaExceededResult, QuotaResetRecoveryConfigResponse, SelfHealConfigResponse,
-    SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetCustomModelsRequest,
-    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest, SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest,
+    AddCredentialResponse, AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem,
+    AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
+    CacheMeteringConfigResponse, CacheMeteringStatsResponse, CheckRateLimitRequest,
+    CredentialMetadataDetail, CredentialMetadataSchemaConfig, CredentialStatusItem,
+    CredentialsExportResponse, CredentialsStatusResponse, CustomModelItem,
+    CustomModelsConfigResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
+    GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
+    LogGovernanceConfigResponse, ModelApiRetryConfigResponse, ModelSelectionMode, ModelTestRequest,
+    ModelTestResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
+    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, QuotaResetRecoveryConfigResponse,
+    SelfHealConfigResponse, SessionAffinityConfigResponse, SetAccountRpmLimitConfigRequest,
+    SetAccountThrottleConfigRequest, SetCacheMeteringConfigRequest, SetCustomModelsRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest,
+    SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest, SetSessionAffinityConfigRequest,
     SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
     StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
     UpdateRefreshTokenRequest,
@@ -727,21 +725,61 @@ impl AdminService {
         self
     }
 
-    /// 查询 prompt cache 计量模拟配置。
+    /// 查询 prompt cache 计量模拟配置与运行指标。
     ///
     /// 运行时句柄优先（反映当前真实生效状态）；句柄缺失时回落到 config.json
-    /// 显式值、再回落到环境变量与默认值，与启动时的优先级一致。
+    /// 显式值、再回落到环境变量与默认值，与启动时的优先级一致，`stats` 为 `null`。
     pub fn get_cache_metering_config(&self) -> CacheMeteringConfigResponse {
-        let enabled = match self.cache_meter.as_ref() {
-            Some(meter) => meter.is_enabled(),
-            None => self
-                .token_manager
-                .config()
+        use crate::anthropic::cache_metering::CacheMeter;
+
+        if let Some(meter) = self.cache_meter.as_ref() {
+            let stats = meter.stats_total();
+            return CacheMeteringConfigResponse {
+                enabled: meter.is_enabled(),
+                capacity: meter.capacity(),
+                persist_enabled: meter.persist_enabled(),
+                flush_interval_secs: meter.flush_interval_secs(),
+                miss_diagnostics: meter.miss_diagnostics(),
+                stats: Some(CacheMeteringStatsResponse {
+                    entries_len: meter.len(),
+                    hits: stats.hits,
+                    misses: stats.misses,
+                    miss_no_entry: stats.miss_no_entry,
+                    miss_expired: stats.miss_expired,
+                    miss_evicted: stats.miss_evicted,
+                    miss_no_breakpoint: stats.miss_no_breakpoint,
+                    miss_no_seed: stats.miss_no_seed,
+                    evicted_total: stats.evicted_total,
+                    expired_total: stats.expired_total,
+                    tombstone_clears: stats.tombstone_clears,
+                }),
+            };
+        }
+
+        let config = self.token_manager.config();
+        CacheMeteringConfigResponse {
+            enabled: config
                 .cache_metering_enabled
-                .or_else(crate::anthropic::cache_metering::CacheMeter::metering_enabled_from_env)
+                .or_else(CacheMeter::metering_enabled_from_env)
                 .unwrap_or(true),
-        };
-        CacheMeteringConfigResponse { enabled }
+            capacity: CacheMeter::resolve_capacity(
+                config.cache_metering_capacity,
+                CacheMeter::capacity_from_env(),
+            ),
+            persist_enabled: config
+                .cache_metering_persist_enabled
+                .or_else(CacheMeter::persist_enabled_from_env)
+                .unwrap_or(false),
+            flush_interval_secs: CacheMeter::resolve_flush_interval_secs(
+                config.cache_metering_flush_interval_secs,
+                CacheMeter::flush_interval_from_env(),
+            ),
+            miss_diagnostics: config
+                .cache_metering_miss_diagnostics
+                .or_else(CacheMeter::miss_diagnostics_from_env)
+                .unwrap_or(true),
+            stats: None,
+        }
     }
 
     /// 更新 prompt cache 计量模拟配置：改运行时原子值 + 持久化到 config.json。
@@ -3875,9 +3913,15 @@ mod tests {
             overage_capability_raw: None,
         };
 
-        assert!(quota_reset_is_due(balance(Some(100.0)).next_reset_at, 100.0));
+        assert!(quota_reset_is_due(
+            balance(Some(100.0)).next_reset_at,
+            100.0
+        ));
         assert!(quota_reset_is_due(balance(Some(99.0)).next_reset_at, 100.0));
-        assert!(!quota_reset_is_due(balance(Some(101.0)).next_reset_at, 100.0));
+        assert!(!quota_reset_is_due(
+            balance(Some(101.0)).next_reset_at,
+            100.0
+        ));
         assert!(!quota_reset_is_due(balance(None).next_reset_at, 100.0));
     }
 
@@ -4125,5 +4169,109 @@ mod tests {
             "Enterprise"
         );
         assert_eq!(subscription_type_from_title(None), "Free");
+    }
+}
+
+#[cfg(test)]
+mod cache_metering_config_tests {
+    use super::*;
+    use crate::anthropic::cache_metering::CacheMeter;
+
+    fn service_with(config: Config) -> AdminService {
+        let manager =
+            Arc::new(MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap());
+        AdminService::new(manager, Vec::new())
+    }
+
+    /// Review Focus 4：句柄缺失时 stats 为 null、配置回落到 config/env/默认，不得 panic。
+    #[tokio::test]
+    async fn config_falls_back_without_cache_meter_handle() {
+        let service = service_with(Config::default());
+        let resp = service.get_cache_metering_config();
+        let json = serde_json::to_value(&resp).unwrap();
+
+        assert_eq!(json["capacity"], 262_144, "回落到内置默认容量");
+        assert_eq!(json["persistEnabled"], false);
+        assert_eq!(json["flushIntervalSecs"], 300);
+        assert_eq!(json["missDiagnostics"], true);
+        assert!(json["stats"].is_null(), "句柄缺失时 stats 必须是 null");
+    }
+
+    /// config.json 显式值在句柄缺失时也要生效（而不是永远吐默认值）。
+    #[tokio::test]
+    async fn config_explicit_values_win_without_handle() {
+        let mut config = Config::default();
+        config.cache_metering_capacity = Some(4_096);
+        config.cache_metering_persist_enabled = Some(true);
+        config.cache_metering_flush_interval_secs = Some(600);
+        config.cache_metering_miss_diagnostics = Some(false);
+
+        let json = serde_json::to_value(service_with(config).get_cache_metering_config()).unwrap();
+        assert_eq!(json["capacity"], 4_096);
+        assert_eq!(json["persistEnabled"], true);
+        assert_eq!(json["flushIntervalSecs"], 600);
+        assert_eq!(json["missDiagnostics"], false);
+        assert!(json["stats"].is_null());
+    }
+
+    /// 有句柄时一律以运行时真实值为准，config.json 里写什么都不算数。
+    #[tokio::test]
+    async fn runtime_handle_overrides_config_values() {
+        let mut config = Config::default();
+        // 故意和句柄对着写，验证优先级
+        config.cache_metering_capacity = Some(262_144);
+        config.cache_metering_flush_interval_secs = Some(300);
+        config.cache_metering_miss_diagnostics = Some(true);
+
+        let meter = Arc::new(
+            CacheMeter::new(None)
+                .with_capacity(4_096)
+                .with_miss_diagnostics(false)
+                .with_flush_interval_secs(600),
+        );
+        meter.record_entry(1, 10, 300);
+        assert_eq!(meter.lookup_and_renew(1), Some(10));
+        assert_eq!(meter.lookup_and_renew(2), None);
+
+        let service = service_with(config).with_cache_meter(meter);
+        let json = serde_json::to_value(service.get_cache_metering_config()).unwrap();
+
+        assert_eq!(json["capacity"], 4_096, "以句柄为准");
+        assert_eq!(json["flushIntervalSecs"], 600);
+        assert_eq!(json["missDiagnostics"], false);
+        assert_eq!(json["persistEnabled"], false);
+        assert_eq!(json["stats"]["entriesLen"], 1);
+        assert_eq!(json["stats"]["hits"], 1);
+        assert_eq!(json["stats"]["missNoEntry"], 1);
+    }
+
+    /// PUT 只改 `enabled`，其余只读字段必须原样保留（回归：别被顺手覆写成默认值）。
+    #[tokio::test]
+    async fn put_only_toggles_enabled() {
+        let meter = Arc::new(
+            CacheMeter::new(None)
+                .with_capacity(4_096)
+                .with_flush_interval_secs(600)
+                .with_miss_diagnostics(false),
+        );
+        let service = service_with(Config::default()).with_cache_meter(meter);
+
+        let before = serde_json::to_value(service.get_cache_metering_config()).unwrap();
+        let resp = service
+            .set_cache_metering_config(SetCacheMeteringConfigRequest {
+                enabled: Some(false),
+            })
+            .expect("PUT 应成功");
+        let after = serde_json::to_value(&resp).unwrap();
+
+        assert_eq!(after["enabled"], false, "enabled 必须被改掉");
+        for key in [
+            "capacity",
+            "flushIntervalSecs",
+            "missDiagnostics",
+            "persistEnabled",
+        ] {
+            assert_eq!(after[key], before[key], "{key} 是只读字段，PUT 不得改动");
+        }
     }
 }

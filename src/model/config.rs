@@ -291,6 +291,35 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_metering_enabled: Option<bool>,
 
+    /// prompt cache 计量模拟的条目上限。未设置时回落到 `KIRO_RS_CACHE_CAPACITY`
+    /// 环境变量，再回落到内置默认 262144。
+    ///
+    /// 选型公式：`C >= peak_req_per_sec * entries_per_req * TTL_secs`。
+    /// 生效值钳到 `[1024, 8388608]`。启动时固定，运行时不可改。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_capacity: Option<usize>,
+
+    /// 是否把 prompt cache 计量快照落到 `cache_metering.json`。未设置时回落到
+    /// `KIRO_RS_CACHE_PERSIST` 环境变量，再回落到默认**关闭**。
+    ///
+    /// 关闭后启动不读该文件、运行与退出都不写该文件，也不会删除已有文件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_persist_enabled: Option<bool>,
+
+    /// prompt cache 计量快照的落盘间隔（秒）。未设置时回落到
+    /// `KIRO_RS_CACHE_FLUSH_INTERVAL_SECS` 环境变量，再回落到默认 300。
+    /// 生效值钳到 `[10, 3600]`。仅在落盘开启时有意义。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_flush_interval_secs: Option<u64>,
+
+    /// 是否开启 miss 归因（墓碑表，用于区分 `miss_evicted` / `miss_expired`）。
+    /// 未设置时回落到 `KIRO_RS_CACHE_MISS_DIAGNOSTICS` 环境变量，再回落到默认开启。
+    ///
+    /// 关闭后不建墓碑表（内存归零），`miss_evicted` 退化为 `miss_no_entry`，
+    /// 其余计数器与 `entries_len` 仍然输出。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_miss_diagnostics: Option<bool>,
+
     /// 是否启用请求链路追踪（写 traces.db）。默认 true。
     ///
     /// 关闭后：不再写入 trace 记录、不走 TraceSink，但 `GET /api/admin/traces`
@@ -495,6 +524,10 @@ impl Default for Config {
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
             cache_metering_enabled: None,
+            cache_metering_capacity: None,
+            cache_metering_persist_enabled: None,
+            cache_metering_flush_interval_secs: None,
+            cache_metering_miss_diagnostics: None,
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
@@ -663,8 +696,7 @@ mod tests {
 
     #[test]
     fn model_api_429_retry_accepts_explicitly_disabled() {
-        let config: Config =
-            serde_json::from_str(r#"{"modelApi429RetryEnabled":false}"#).unwrap();
+        let config: Config = serde_json::from_str(r#"{"modelApi429RetryEnabled":false}"#).unwrap();
         assert!(!config.model_api_429_retry_enabled);
     }
 

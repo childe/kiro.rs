@@ -12,6 +12,10 @@
   "updateAutoApplyTime": "03:00",
   "modelCacheTtlSecs": 3600,
   "modelApi429RetryEnabled": true,
+  "cacheMeteringCapacity": 262144,
+  "cacheMeteringPersistEnabled": false,
+  "cacheMeteringFlushIntervalSecs": 300,
+  "cacheMeteringMissDiagnostics": true,
   "traceEnabled": true,
   "traceRetentionDays": 7,
   "usageLogRetentionDays": 31
