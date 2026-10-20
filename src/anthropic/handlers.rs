@@ -902,6 +902,8 @@ pub async fn post_messages(
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
+            state.cache_meter.clone(),
+            key_ctx.key_id,
         )
         .await;
     }
@@ -1540,6 +1542,9 @@ pub(crate) async fn execute_non_stream_request(
     // 半截 / 非法 JSON 显式暴露为错误（返回 502），不再静默回退 {} 或丢弃。
     let mut tool_accumulator = super::stream::ToolJsonAccumulator::new();
     let mut tool_json_error: Option<super::stream::ToolJsonAccumulatorError> = None;
+    // 上游内容过滤拒答：拦截后只剩 reasoning，必须显式标成 refusal，
+    // 否则会被当成正常 end_turn 的空响应返回。
+    let mut refused = false;
 
     while let Some(chunk) = body_stream.next().await {
         let body_bytes = match chunk {
@@ -1636,6 +1641,10 @@ pub(crate) async fn execute_non_stream_request(
                                     // 单条 provider 流内是最终快照，重复事件取最后一份。
                                     provider_token_usage = Some(usage);
                                 }
+                                if let Some(refusal) = metadata.content_filter_refusal() {
+                                    tracing::warn!("上游内容过滤拒答: {}", refusal);
+                                    refused = true;
+                                }
                             }
                             Event::ContextUsage(context_usage) => {
                                 // 从上下文使用百分比计算实际的 input_tokens
@@ -1700,7 +1709,11 @@ pub(crate) async fn execute_non_stream_request(
     // 收尾：无参工具的 0 字节滞留缓冲在此还原为 {} 补进 content；累积了非空内容
     // 却从未收到 stop=true 的（上游在参数写到一半时截断）返回 IncompleteJson。
     // 已有错误则保持不变。
-    if tool_json_error.is_none() {
+    if refused {
+        // A filter refusal can cut off tool arguments. Do not recover pending
+        // calls or replace the authoritative refusal with their JSON errors.
+        tool_json_error = None;
+    } else if tool_json_error.is_none() {
         match tool_accumulator.finish(&tool_name_map) {
             Ok(recovered) => {
                 for completed in recovered {
@@ -1768,8 +1781,10 @@ pub(crate) async fn execute_non_stream_request(
         ));
     }
 
-    // 确定 stop_reason
-    if has_tool_use && stop_reason == "end_turn" {
+    // 确定 stop_reason：拒答是终态，优先于同流内的 max_tokens / 上下文溢出 / tool_use。
+    if refused {
+        stop_reason = super::stream::REFUSAL_STOP_REASON.to_string();
+    } else if has_tool_use && stop_reason == "end_turn" {
         stop_reason = "tool_use".to_string();
     }
 
@@ -2070,6 +2085,8 @@ pub async fn post_messages_cc(
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
+            state.cache_meter.clone(),
+            key_ctx.key_id,
         )
         .await;
     }

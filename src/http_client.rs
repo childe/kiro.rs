@@ -49,30 +49,41 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    Ok(client_builder(proxy, timeout_secs, tls_backend)?.build()?)
+    Ok(client_builder(proxy, tls_backend)?
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()?)
 }
 
 /// API streams need separate connection and idle deadlines; active reads reset
-/// the idle timer, so long answers can still use the existing total budget.
+/// the idle timer, so upstream silence is bounded without bounding the answer.
+///
+/// `total_secs` is the deadline for the whole request, body included. It is a
+/// wall clock that an active stream cannot reset, so any overall budget doubles
+/// as a cap on answer length: a request still delivering tokens at the deadline
+/// dies with a half-written body, and every token already generated is paid for
+/// and lost. Pass 0 to drop that cap — a stalled upstream is still caught by
+/// `read_secs`, which measures silence rather than total work.
 pub fn build_client_with_timeouts(
     proxy: Option<&ProxyConfig>,
-    timeout_secs: u64,
+    total_secs: u64,
     tls_backend: TlsBackend,
     connect_secs: u64,
     read_secs: u64,
 ) -> anyhow::Result<Client> {
-    Ok(client_builder(proxy, timeout_secs, tls_backend)?
+    let mut builder = client_builder(proxy, tls_backend)?
         .connect_timeout(Duration::from_secs(connect_secs.max(1)))
-        .read_timeout(Duration::from_secs(read_secs.max(1)))
-        .build()?)
+        .read_timeout(Duration::from_secs(read_secs.max(1)));
+    if total_secs > 0 {
+        builder = builder.timeout(Duration::from_secs(total_secs));
+    }
+    Ok(builder.build()?)
 }
 
 fn client_builder(
     proxy: Option<&ProxyConfig>,
-    timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<reqwest::ClientBuilder> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    let mut builder = Client::builder();
 
     match tls_backend {
         TlsBackend::Rustls => {
@@ -108,6 +119,8 @@ fn client_builder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_proxy_config_new() {
@@ -136,5 +149,109 @@ mod tests {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    /// Serves one chunked response that stays active the whole time: a chunk,
+    /// a `gap` pause, then a final chunk. Never silent for longer than `gap`,
+    /// so an idle deadline above `gap` must not fire.
+    async fn serve_one_slow_stream(gap: Duration) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut discard = [0u8; 1024];
+            let _ = socket.read(&mut discard).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n",
+                )
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(gap).await;
+            socket.write_all(b"2\r\nho\r\n0\r\n\r\n").await.unwrap();
+            socket.flush().await.unwrap();
+        });
+        addr
+    }
+
+    /// The regression: a stream that keeps delivering must not be cut by the
+    /// overall deadline. 0 means "no overall deadline"; the idle deadline
+    /// still guards a stalled upstream.
+    #[tokio::test]
+    async fn active_stream_outlives_disabled_total_timeout() {
+        let addr = serve_one_slow_stream(Duration::from_secs(2)).await;
+        let client = build_client_with_timeouts(None, 0, TlsBackend::Rustls, 15, 120).unwrap();
+
+        let body = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .expect("active stream must not be cut short");
+        assert_eq!(body, "hiho");
+    }
+
+    /// Serves headers and one chunk, then holds the connection open and silent.
+    /// Models the case the idle deadline exists for: an upstream that stopped
+    /// producing without closing the socket.
+    async fn serve_one_stalled_stream() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut discard = [0u8; 1024];
+            let _ = socket.read(&mut discard).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n",
+                )
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            // Never write again, never close: hold the socket past the test.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        addr
+    }
+
+    /// Disabling the overall deadline must not disable stall detection: the
+    /// idle deadline still cuts an upstream that went quiet. This is what makes
+    /// 0 a safe setting rather than an unbounded wait.
+    #[tokio::test]
+    async fn stalled_stream_is_cut_by_read_timeout_without_total_timeout() {
+        let addr = serve_one_stalled_stream().await;
+        let client = build_client_with_timeouts(None, 0, TlsBackend::Rustls, 15, 1).unwrap();
+
+        let err = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .expect_err("a silent upstream must still be cut by the idle deadline");
+        assert!(err.is_timeout(), "expected a timeout, got: {err}");
+    }
+
+    /// A non-zero overall deadline still applies, for callers that want one.
+    #[tokio::test]
+    async fn total_timeout_still_applies_when_set() {
+        let addr = serve_one_slow_stream(Duration::from_secs(2)).await;
+        let client = build_client_with_timeouts(None, 1, TlsBackend::Rustls, 15, 120).unwrap();
+
+        let err = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .expect_err("overall deadline must still cut the stream");
+        assert!(err.is_timeout(), "expected a timeout, got: {err}");
     }
 }

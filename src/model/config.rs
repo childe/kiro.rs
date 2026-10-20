@@ -17,6 +17,28 @@ impl Default for TlsBackend {
     }
 }
 
+/// 对话 / MCP 请求使用的上游域名。
+///
+/// - `Amazonaws`（默认）：`q.{region}.amazonaws.com`
+/// - `Kiro`：`runtime.{region}.kiro.dev`，新版 Kiro IDE / Kiro CLI 使用的域名，
+///   官方客户端仅内置 us-east-1、eu-central-1 等少数区域
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApiDomain {
+    #[default]
+    Amazonaws,
+    Kiro,
+}
+
+impl ApiDomain {
+    pub fn runtime_host(self, region: &str) -> String {
+        match self {
+            Self::Amazonaws => format!("q.{}.amazonaws.com", region),
+            Self::Kiro => format!("runtime.{}.kiro.dev", region),
+        }
+    }
+}
+
 /// 工具兼容模式。
 ///
 /// - `ClaudeCode`（默认）：把 Claude Code 内置工具（Write/Edit/Bash/Read/Glob/Grep/LS/WebSearch）
@@ -115,6 +137,13 @@ pub struct Config {
     /// Maximum silence while waiting for headers or the next upstream body read.
     #[serde(default = "default_upstream_read_timeout_secs")]
     pub upstream_read_timeout_secs: u64,
+
+    /// Deadline for a whole upstream API request, body included. An active
+    /// stream cannot reset it, so it also caps how long an answer may be.
+    /// Defaults to the previously hardcoded 720s; set 0 to disable it and
+    /// leave stalled upstreams to `upstream_read_timeout_secs`.
+    #[serde(default = "default_upstream_total_timeout_secs")]
+    pub upstream_total_timeout_secs: u64,
 
     /// 外部 count_tokens API 地址（可选）
     #[serde(default)]
@@ -282,6 +311,11 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
+    /// 对话 / MCP 请求的上游域名：`amazonaws`（默认）或 `kiro`。
+    /// 仅影响 ide / cli 端点的 generateAssistantResponse 与 mcp，不影响 token 刷新和用量查询
+    #[serde(default)]
+    pub api_domain: ApiDomain,
+
     /// 是否启用中转层 prompt cache 本地计量模拟。未设置时回落到
     /// `KIRO_RS_CACHE_METERING` 环境变量，再回落到默认开启。
     ///
@@ -397,6 +431,9 @@ fn default_upstream_connect_timeout_secs() -> u64 {
 fn default_upstream_read_timeout_secs() -> u64 {
     120
 }
+fn default_upstream_total_timeout_secs() -> u64 {
+    720
+}
 
 fn default_load_balancing_mode() -> String {
     "priority".to_string()
@@ -494,6 +531,7 @@ impl Default for Config {
             tls_backend: default_tls_backend(),
             upstream_connect_timeout_secs: default_upstream_connect_timeout_secs(),
             upstream_read_timeout_secs: default_upstream_read_timeout_secs(),
+            upstream_total_timeout_secs: default_upstream_total_timeout_secs(),
             count_tokens_api_url: None,
             count_tokens_api_key: None,
             count_tokens_auth_type: default_count_tokens_auth_type(),
@@ -523,6 +561,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
+            api_domain: ApiDomain::default(),
             cache_metering_enabled: None,
             cache_metering_capacity: None,
             cache_metering_persist_enabled: None,
@@ -613,6 +652,15 @@ mod tests {
         assert_eq!(Config::default().upstream_read_timeout_secs, 120);
     }
 
+    /// The default keeps the previously hardcoded deadline, so existing
+    /// deployments behave exactly as before this became configurable.
+    #[test]
+    fn upstream_total_timeout_defaults_to_previous_hardcoded_value() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 720);
+        assert_eq!(Config::default().upstream_total_timeout_secs, 720);
+    }
+
     #[test]
     fn upstream_deadlines_accept_explicit_values() {
         let config: Config = serde_json::from_str(
@@ -621,6 +669,20 @@ mod tests {
         .unwrap();
         assert_eq!(config.upstream_connect_timeout_secs, 7);
         assert_eq!(config.upstream_read_timeout_secs, 45);
+    }
+
+    #[test]
+    fn upstream_total_timeout_accepts_explicit_value() {
+        let config: Config = serde_json::from_str(r#"{"upstreamTotalTimeoutSecs":1800}"#).unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 1800);
+    }
+
+    /// 0 is a meaningful setting, not a missing one: it turns the overall
+    /// deadline off for deployments that would rather let long answers finish.
+    #[test]
+    fn upstream_total_timeout_accepts_zero_to_disable() {
+        let config: Config = serde_json::from_str(r#"{"upstreamTotalTimeoutSecs":0}"#).unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 0);
     }
 
     #[test]

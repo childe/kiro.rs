@@ -37,6 +37,7 @@ use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
+<<<<<<< HEAD
     AddCredentialResponse, AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem,
     AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
     CacheMeteringConfigResponse, CacheMeteringStatsResponse, CheckRateLimitRequest,
@@ -51,6 +52,40 @@ use super::types::{
     SetAccountThrottleConfigRequest, SetCacheMeteringConfigRequest, SetCustomModelsRequest,
     SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest,
     SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest, SetSessionAffinityConfigRequest,
+||||||| 1ef319f
+    AddCredentialResponse, AssignProxyRequest,
+    AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
+    BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialMetadataDetail,
+    CredentialStatusItem,
+    CredentialsExportResponse, CredentialsStatusResponse, CustomModelsConfigResponse, CustomModelItem,
+    EnableOverageAllResult, ExportedAccount,
+    ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
+    ModelApiRetryConfigResponse,
+    CredentialMetadataSchemaConfig,
+    CacheMeteringConfigResponse, SetCacheMeteringConfigRequest,
+    SessionAffinityConfigResponse, SetSessionAffinityConfigRequest,
+    LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
+    PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
+    ProxyPoolResponse, QuotaExceededResult, QuotaResetRecoveryConfigResponse, SelfHealConfigResponse,
+    SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetCustomModelsRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest, SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest,
+=======
+    AddCredentialResponse, ApiDomainConfig, AssignProxyRequest, AssignRoundRobinResponse,
+    AvailableModelItem,
+    AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
+    CacheMeteringConfigResponse, CacheMeteringStatsResponse, CheckRateLimitRequest,
+    CredentialMetadataDetail, CredentialMetadataSchemaConfig, CredentialStatusItem,
+    CredentialsExportResponse, CredentialsStatusResponse, CustomModelItem,
+    CustomModelsConfigResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
+    GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
+    LogGovernanceConfigResponse, ModelApiRetryConfigResponse, ModelSelectionMode, ModelTestRequest,
+    ModelTestResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
+    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, QuotaResetRecoveryConfigResponse,
+    SelfHealConfigResponse, SessionAffinityConfigResponse, SetAccountRpmLimitConfigRequest,
+    SetAccountThrottleConfigRequest, SetCacheMeteringConfigRequest, SetCustomModelsRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest,
+    SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest, SetSessionAffinityConfigRequest,
+>>>>>>> upstream/master
     SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
     StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
     UpdateRefreshTokenRequest,
@@ -2467,6 +2502,24 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    /// 获取对话 / MCP 上游域名
+    pub fn get_api_domain(&self) -> ApiDomainConfig {
+        ApiDomainConfig {
+            domain: self.token_manager.api_domain(),
+        }
+    }
+
+    /// 设置对话 / MCP 上游域名（运行时生效 + 持久化 config.json）
+    pub fn set_api_domain(
+        &self,
+        req: ApiDomainConfig,
+    ) -> Result<ApiDomainConfig, AdminServiceError> {
+        self.token_manager
+            .set_api_domain(req.domain)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        Ok(self.get_api_domain())
     }
 
     /// 获取会话粘性路由配置与运行时统计

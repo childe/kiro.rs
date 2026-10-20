@@ -67,14 +67,26 @@ Existing configuration files receive these defaults automatically:
 ```json
 {
   "upstreamConnectTimeoutSecs": 15,
-  "upstreamReadTimeoutSecs": 120
+  "upstreamReadTimeoutSecs": 120,
+  "upstreamTotalTimeoutSecs": 720
 }
 ```
 
 The read setting limits upstream silence while awaiting headers or the next
-body read. It does not limit an active answer to 120 seconds. Zero settings are
-clamped to one second. Runtime credentials and configuration files were not
-changed.
+body read. It does not limit an active answer to 120 seconds. Zero connect/read
+settings are clamped to one second. Runtime credentials and configuration files
+were not changed.
+
+`upstreamTotalTimeoutSecs` is the deadline for a whole request, body included.
+An active stream cannot reset it, so it also caps how long an answer may be: a
+request still delivering tokens when it expires dies with a half-written body,
+and every token already generated is paid for and lost. It defaults to 720,
+the value previously hardcoded in the API client, so behaviour is unchanged
+unless you set it.
+
+Raise it if long agentic turns are being truncated at twelve minutes, or set it
+to 0 to remove the ceiling entirely — a stalled upstream is still caught by
+`upstreamReadTimeoutSecs`, which measures silence rather than total work.
 
 ## TDD and verification
 
